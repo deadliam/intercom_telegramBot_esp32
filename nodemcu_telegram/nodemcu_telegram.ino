@@ -1,32 +1,51 @@
 /*
-  Telegram bot для управления домофоном через ESP8266/Wemos
+  Telegram bot for intercom control via ESP8266/Wemos
   
-  ФУНКЦИОНАЛЬНОСТЬ:
-  - Мониторинг входящих вызовов через аналоговый вход A0 (делитель напряжения)
-  - Автоматическая отправка уведомлений в Telegram при входящих вызовах
-  - Управление домофоном через команду "Open":
-    1. Нажимает кнопку камеры (D1) на 2 секунды  
-    2. Нажимает кнопку замка (D2) кратковременно
+  FUNCTIONALITY:
+  - Monitor incoming calls via analog input A0 (voltage divider)
+  - Automatic Telegram notifications on incoming calls
+  - Intercom control via "Open" command:
+    1. Press camera button (D1) for 2 seconds  
+    2. Press door lock button (D2) briefly
   
-  ПОДКЛЮЧЕНИЕ:
-  - D1 (GPIO5) - оптопара PC817 для кнопки камеры
-  - D2 (GPIO4) - оптопара PC817 для кнопки замка  
-  - A0 - делитель напряжения от светодиода индикации вызова (2x10кОм, делит 1.8В→0.9В)
+  CONNECTIONS:
+  - D1 (GPIO5) - PC817 optocoupler for camera button
+  - D2 (GPIO4) - PC817 optocoupler for door lock button  
+  - A0 - voltage divider from call indicator LED (2x10kOhm, divides 1.8V→0.9V)
+  - Built-in LED (GPIO2) - status indication
   
-  КОМАНДЫ:
-  - /start - главное меню
-  - /status - состояние системы и аналогового входа
-  - "Open" - открытие домофона
+  COMMANDS:
+  - /start - main menu
+  - /status - system status and analog input
+  - "Open" - open intercom
+  
+  LED ERROR CODES:
+  - 1 blink  = WiFi connection failure
+  - 2 blinks = Critical low memory (< 5000 bytes)
+  - 3 blinks = System stuck (no activity 5+ minutes)
+  - 4 blinks = General error
+  - 5 blinks = Telegram connection error
+  
+  LED patterns repeat every 3 seconds when error occurs
 */
 
 #ifdef ESP32
   #include <WiFi.h>
+  #include <WebServer.h>
 #else
   #include <ESP8266WiFi.h>
+  #include <ESP8266WebServer.h>
 #endif
 #include <WiFiClientSecure.h>
 #include <UniversalTelegramBot.h>
 #include <ArduinoJson.h>
+
+// WiFiManager and OTA libraries
+#include <DNSServer.h>
+#include <WiFiManager.h>
+#include <ESP8266mDNS.h>
+#include <ElegantOTA.h>
+#include <EEPROM.h>
 // Local secrets (not committed). See secrets.example.h for the template
 #if defined(__has_include)
   #if __has_include("../secrets.h")
@@ -58,25 +77,46 @@ const char* password = WIFI_PASSWORD;
 WiFiClientSecure client;
 UniversalTelegramBot bot(BOT_TOKEN, client);
 
+// Web server and OTA setup
+#ifdef ESP32
+  WebServer server(80);
+#else
+  ESP8266WebServer server(80);
+#endif
+
+unsigned long ota_progress_millis = 0;
+
 // Polling period (ms)
 int botRequestDelay = 2000;
 unsigned long lastTimeBotRan;
 
-// UniversalTelegramBot variables
+// EEPROM settings structure
+struct IntercomSettings {
+  int cameraActivationTime;    // Camera activation time in ms
+  int callThreshold;          // Threshold value for A0
+  int callDebounceTime;       // Call debounce time in ms  
+  int doorActivationTime;     // Door activation time in ms
+  char botToken[50];          // Telegram bot token
+  char chatId[20];            // Telegram Chat ID
+  unsigned long rebootCount;   // Count of system reboots
+  unsigned long lastUptime;    // Last uptime before reboot (minutes)
+};
+
+IntercomSettings settings;
+const int EEPROM_ADDR = 0;
 
 // GPIO for onboard LED (optional)
 const int ledPin = 2;
 bool ledState = LOW;
 
 // Intercom configuration
-const int cameraPin = 5;       // GPIO5 (D1 on Wemos) - кнопка включения камеры 
-const int doorPin = 4;         // GPIO4 (D2 on Wemos) - кнопка открытия замка
-const bool optocouplerActiveHigh = false; // PC817 оптопары обычно активны при LOW
+const int cameraPin = 5;       // GPIO5 (D1 on Wemos) - camera activation button 
+const int doorPin = 4;         // GPIO4 (D2 on Wemos) - door lock button
+const bool optocouplerActiveHigh = false; // PC817 optocouplers are usually active LOW
 
 // Call detection configuration
-const int callIndicatorPin = A0;  // Аналоговый вход для мониторинга вызова
-const int normalVoltageThreshold = 200;  // Пороговое значение (0.9V через делитель = ~279, ставим 200 для надежности)
-const unsigned long callDebounceTime = 5000;  // 5 секунд между уведомлениями о вызовах
+const int callIndicatorPin = A0;  // Analog input for call monitoring
+// Settings below are loaded from EEPROM or use default values
 
 // Call detection variables
 bool callDetected = false;
@@ -86,14 +126,107 @@ unsigned long lastCallTime = 0;
 // Reply keyboard with one "Open" button (persistent chat menu)
 static const char replyKeyboard[] = "[[\"Open\"]]";
 
-// Функция для нажатия кнопки камеры (2 секунды)
+// ========== LED ERROR INDICATION FUNCTIONS ==========
+
+// Blink built-in LED with error code (number of blinks)
+void blinkErrorCode(int errorCode) {
+  const int blinkDuration = 200;    // Short blink duration
+  const int pauseBetween = 300;     // Pause between blinks
+  const int pauseAfter = 2000;      // Pause after sequence
+  
+  Serial.print("🚨 LED Error Code: "); Serial.print(errorCode); Serial.println(" blinks");
+  
+  for (int i = 0; i < errorCode; i++) {
+    digitalWrite(ledPin, LOW);   // Turn LED ON (built-in LED is active LOW)
+    delay(blinkDuration);
+    digitalWrite(ledPin, HIGH);  // Turn LED OFF
+    
+    if (i < errorCode - 1) {     // Pause between blinks (except after last)
+      delay(pauseBetween);
+    }
+  }
+  
+  delay(pauseAfter);  // Pause after complete sequence
+}
+
+// Continuous error indication with specified code
+void indicateError(int errorCode, int repeatTimes = 3) {
+  Serial.print("🚨 Indicating error code "); Serial.print(errorCode);
+  Serial.print(" ("); Serial.print(repeatTimes); Serial.println(" times)");
+  
+  for (int i = 0; i < repeatTimes; i++) {
+    blinkErrorCode(errorCode);
+  }
+}
+
+// ========== EEPROM AND SETTINGS FUNCTIONS ==========
+
+void saveSettings() {
+  EEPROM.put(EEPROM_ADDR, settings);
+  EEPROM.commit();
+  Serial.println("⚙️ Settings saved to EEPROM");
+}
+
+void loadSettings() {
+  EEPROM.get(EEPROM_ADDR, settings);
+
+  // Validate settings (check if values are reasonable)
+  if (settings.cameraActivationTime < 100 || settings.cameraActivationTime > 10000) {
+    // Load default settings
+    settings.cameraActivationTime = 2000;  // 2 seconds for camera
+    settings.callThreshold = 200;          // A0 threshold value
+    settings.callDebounceTime = 5000;      // 5 seconds debounce
+    settings.doorActivationTime = 200;     // 200ms for door lock
+    strncpy(settings.botToken, BOT_TOKEN, sizeof(settings.botToken) - 1);
+    strncpy(settings.chatId, CHAT_ID, sizeof(settings.chatId) - 1);
+    settings.rebootCount = 1;              // First boot
+    settings.lastUptime = 0;               // No previous uptime
+    
+    Serial.println("⚙️ Loading default settings");
+    saveSettings();
+  } else {
+    // Update reboot statistics
+    settings.lastUptime = millis() / 60000;  // Previous uptime in minutes (will be 0 on first boot)
+    settings.rebootCount++;
+    Serial.println("⚙️ Settings loaded from EEPROM");
+    Serial.print("📊 Boot count: "); Serial.println(settings.rebootCount);
+    Serial.print("⏱️ Last uptime: "); Serial.print(settings.lastUptime); Serial.println(" minutes");
+    saveSettings(); // Save updated boot count
+  }
+}
+
+// ========== OTA CALLBACK FUNCTIONS ==========
+
+void onOTAStart() {
+  Serial.println("🔄 OTA update started!");
+  // Disable intercom during update
+}
+
+void onOTAProgress(size_t current, size_t final) {
+  if (millis() - ota_progress_millis > 1000) {
+    ota_progress_millis = millis();
+    Serial.printf("🔄 OTA Progress: %u/%u bytes (%.1f%%)\n", 
+                  current, final, (float)current / final * 100);
+  }
+}
+
+void onOTAEnd(bool success) {
+  if (success) {
+    Serial.println("✅ OTA update finished successfully!");
+  } else {
+    Serial.println("❌ OTA update failed!");
+  }
+}
+
+// Function to press camera button (timing from settings)
 void pressCameraButton() {
   Serial.println("🎥 === CAMERA BUTTON PRESS START ===");
   Serial.print("Setting pin "); Serial.print(cameraPin); 
   Serial.print(" to "); Serial.println(optocouplerActiveHigh ? "HIGH" : "LOW");
+  Serial.print("Duration: "); Serial.print(settings.cameraActivationTime); Serial.println("ms");
   
   digitalWrite(cameraPin, optocouplerActiveHigh ? HIGH : LOW);
-  delay(2000); // 2 секунды
+  delay(settings.cameraActivationTime); // Time from settings
   digitalWrite(cameraPin, optocouplerActiveHigh ? LOW : HIGH);
   
   Serial.print("Setting pin "); Serial.print(cameraPin); 
@@ -101,14 +234,15 @@ void pressCameraButton() {
   Serial.println("🎥 === CAMERA BUTTON RELEASE ===");
 }
 
-// Функция для кратковременного нажатия кнопки замка
+// Function for brief door lock button press (timing from settings)
 void pressDoorButton() {
   Serial.println("🚪 === DOOR BUTTON PRESS START ===");
   Serial.print("Setting pin "); Serial.print(doorPin); 
   Serial.print(" to "); Serial.println(optocouplerActiveHigh ? "HIGH" : "LOW");
+  Serial.print("Duration: "); Serial.print(settings.doorActivationTime); Serial.println("ms");
   
   digitalWrite(doorPin, optocouplerActiveHigh ? HIGH : LOW);
-  delay(200); // Кратковременное нажатие 200ms
+  delay(settings.doorActivationTime); // Time from settings
   digitalWrite(doorPin, optocouplerActiveHigh ? LOW : HIGH);
   
   Serial.print("Setting pin "); Serial.print(doorPin); 
@@ -116,50 +250,50 @@ void pressDoorButton() {
   Serial.println("🚪 === DOOR BUTTON RELEASE ===");
 }
 
-// Полная последовательность открытия домофона
+// Complete intercom opening sequence
 void openIntercom() {
   Serial.println("=== Starting intercom opening sequence ===");
   
-  // Сначала включаем камеру
+  // First activate camera
   pressCameraButton();
   
-  // Небольшая пауза между операциями
+  // Small pause between operations
   delay(500);
   
-  // Затем открываем замок
+  // Then open door lock
   pressDoorButton();
   
   Serial.println("=== Intercom opening sequence completed ===");
 }
 
-// Функция проверки входящего вызова
+// Function to check incoming calls
 void checkIncomingCall() {
   int analogValue = analogRead(callIndicatorPin);
-  bool currentCallState = (analogValue < normalVoltageThreshold);
+  bool currentCallState = (analogValue < settings.callThreshold);
   
-  // Отладочная информация каждые 10 секунд
+  // Debug information every 10 seconds
   static unsigned long lastDebugTime = 0;
   if (millis() - lastDebugTime > 10000) {
     Serial.print("Call indicator A0 value: ");
     Serial.print(analogValue);
     Serial.print(" (threshold: ");
-    Serial.print(normalVoltageThreshold);
+    Serial.print(settings.callThreshold);
     Serial.println(")");
     lastDebugTime = millis();
   }
   
-  // Обнаружение нового вызова
+  // New call detection
   if (currentCallState && !lastCallState) {
-    // Новый вызов обнаружен
-    if (millis() - lastCallTime > callDebounceTime) {
+    // New call detected
+    if (millis() - lastCallTime > settings.callDebounceTime) {
       callDetected = true;
       lastCallTime = millis();
       
-      // Уведомление о вызове через Telegram
+      // Call notification via Telegram
       Serial.println("🔔 === INCOMING CALL DETECTED ===");
       Serial.println("📞 Someone is calling the intercom!");
       
-      String callMessage = "🔔 ВХОДЯЩИЙ ВЫЗОВ!\n\nКто-то звонит в домофон.\nНажмите 'Open' чтобы открыть.";
+      String callMessage = "🔔 INCOMING CALL!\n\nSomeone is calling the intercom.\nPress 'Open' to open.";
       bool sent = bot.sendMessageWithReplyKeyboard(CHAT_ID, callMessage, "", replyKeyboard, true, false, false);
       Serial.print("📤 Telegram notification: "); Serial.println(sent ? "✅ Sent" : "❌ Failed");
       
@@ -197,43 +331,62 @@ void handleNewMessages(int numNewMessages) {
     // Normal text messages only; reply keyboard sends text "Open"
     if (text == "/start") {
       Serial.println("🏠 Processing /start command");
-      String welcome = "🏠 Добро пожаловать, " + from_name + "!\n\nЭтот бот управляет домофоном:\n• Мониторинг входящих вызовов 🔔\n• Открытие домофона 🚪\n\nНажмите 'Open' для открытия или /status для состояния системы.";
+      String welcome = "🏠 Welcome, " + from_name + "!\n\nThis bot controls the intercom:\n• Monitor incoming calls 🔔\n• Open intercom 🚪\n\nPress 'Open' to open or /status for system status.";
       bot.sendMessageWithReplyKeyboard(chat_id, welcome, "", replyKeyboard, true, false, false);
     } else if (text == "Open") {
       Serial.println("🚪 Processing 'Open' command - INTERCOM SEQUENCE START");
-      bot.sendMessage(chat_id, "🎥 Включаю камеру домофона...", "");
+      bot.sendMessage(chat_id, "🎥 Activating intercom camera...", "");
       
       // Включаем камеру (2 секунды)
       pressCameraButton();
       
-      bot.sendMessage(chat_id, "🚪 Открываю замок...", "");
+      bot.sendMessage(chat_id, "🚪 Opening door lock...", "");
       
       // Пауза и открытие замка
       delay(500);
       pressDoorButton();
       
-      bot.sendMessage(chat_id, "✅ Домофон открыт!", "");
+      bot.sendMessage(chat_id, "✅ Intercom opened!", "");
       Serial.println("🚪 INTERCOM SEQUENCE COMPLETED");
     } else if (text == "/status") {
       Serial.println("📊 Processing /status command");
       // Команда для проверки состояния системы
       int analogValue = analogRead(callIndicatorPin);
-      String statusMessage = "📊 СОСТОЯНИЕ СИСТЕМЫ\n\n";
-      statusMessage += "🔌 Аналоговый вход A0: " + String(analogValue) + "\n";
-      statusMessage += "⚡ Пороговое значение: " + String(normalVoltageThreshold) + "\n";
-      statusMessage += "🚨 Состояние вызова: " + String(analogValue < normalVoltageThreshold ? "ВЫЗОВ" : "НОРМА") + "\n";
-      statusMessage += "🌐 IP адрес: " + WiFi.localIP().toString();
+      String statusMessage = "🏠 Intercom bot started!\n";
+      statusMessage += "IP: " + WiFi.localIP().toString() + "\n\n";
+      statusMessage += "System ready to work!\n\n";
+      statusMessage += "📊 SYSTEM STATUS\n\n";
+      statusMessage += "🔌 Analog input A0: " + String(analogValue) + "\n";
+      statusMessage += "⚡ Threshold value: " + String(settings.callThreshold) + "\n";
+      statusMessage += "🚨 Call status: " + String(analogValue < settings.callThreshold ? "CALL" : "NORMAL") + "\n";
+      statusMessage += "🎥 Camera time: " + String(settings.cameraActivationTime) + "ms\n";
+      statusMessage += "🚪 Door time: " + String(settings.doorActivationTime) + "ms\n";
+      statusMessage += "⏱️ Call debounce: " + String(settings.callDebounceTime) + "ms\n\n";
+      statusMessage += "📈 SYSTEM INFO\n\n";
+      statusMessage += "💾 Free memory: " + String(ESP.getFreeHeap()) + " bytes\n";
+      statusMessage += "⏰ Current uptime: " + String(millis() / 60000) + " min\n";
+      statusMessage += "📊 Boot count: " + String(settings.rebootCount) + "\n";
+      statusMessage += "🔄 Reset reason: " + ESP.getResetReason() + "\n\n";
+      statusMessage += "🌐 WEB INTERFACE\n\n";
+      statusMessage += "🏠 Main: http://" + WiFi.localIP().toString() + "/\n";
+      statusMessage += "⚙️ Settings: http://" + WiFi.localIP().toString() + "/settings\n";
+      statusMessage += "🔄 OTA Update: http://" + WiFi.localIP().toString() + "/update\n";
+      statusMessage += "🌐 mDNS: http://intercom.local/";
       
       bot.sendMessage(chat_id, statusMessage, "");
     } else {
       Serial.print("❓ Unknown command received: '"); Serial.print(text); Serial.println("'");
-      bot.sendMessageWithReplyKeyboard(chat_id, "🏠 Для открытия домофона нажмите кнопку 'Open'\n\nДоступные команды:\n/start - главное меню\n/status - состояние системы", "", replyKeyboard, true, false, false);
+      bot.sendMessageWithReplyKeyboard(chat_id, "🏠 To open the intercom press 'Open' button\n\nAvailable commands:\n/start - main menu\n/status - system status", "", replyKeyboard, true, false, false);
     }
   }
 }
 
 void setup() {
   Serial.begin(115200);
+  
+  // Initialize EEPROM for settings
+  EEPROM.begin(sizeof(IntercomSettings));
+  loadSettings();
   
   Serial.println("=== CONFIGURATION DEBUG ===");
   Serial.print("Secrets loaded from: "); Serial.println(SECRETS_SOURCE);
@@ -242,14 +395,20 @@ void setup() {
   Serial.print("Bot Token: "); Serial.println(BOT_TOKEN);
   Serial.print("Chat ID: "); Serial.println(CHAT_ID);
   
-  // Проверяем, загрузились ли реальные данные
+  Serial.println("=== RESET DIAGNOSIS ===");
+  Serial.print("🔄 Reset reason: "); Serial.println(ESP.getResetReason());
+  Serial.print("💾 Free heap: "); Serial.print(ESP.getFreeHeap()); Serial.println(" bytes");
+  Serial.print("⚡ CPU frequency: "); Serial.print(ESP.getCpuFreqMHz()); Serial.println(" MHz");
+  Serial.print("🔌 VCC: "); Serial.print(ESP.getVcc()); Serial.println(" mV (if ADC_VCC enabled)");
+  
+  // Check if real data was loaded
   if (String(WIFI_SSID) == "YOUR_WIFI_SSID") {
     Serial.println("🚨 WARNING: Using template values! Real secrets.h not loaded!");
   } else {
     Serial.println("✅ Real secrets loaded successfully");
   }
   
-  // Важная информация для отладки
+  // Important information for debugging
   Serial.println("💬 SYSTEM INFO:");
   Serial.print("Chat ID: "); Serial.println(CHAT_ID);
   Serial.print("Board: "); 
@@ -269,11 +428,11 @@ void setup() {
   pinMode(ledPin, OUTPUT);
   digitalWrite(ledPin, ledState);
   
-  // Инициализация пинов для управления домофоном
+  // Initialize pins for intercom control
   pinMode(cameraPin, OUTPUT);
   pinMode(doorPin, OUTPUT);
   
-  // Устанавливаем пины в неактивное состояние (кнопки не нажаты)
+  // Set pins to inactive state (buttons not pressed)
   digitalWrite(cameraPin, optocouplerActiveHigh ? LOW : HIGH);
   digitalWrite(doorPin, optocouplerActiveHigh ? LOW : HIGH);
   
@@ -283,14 +442,17 @@ void setup() {
   Serial.print("Door button: GPIO"); Serial.print(doorPin); 
   Serial.println(" (should be D2 on Wemos/D4 on NodeMCU)");
   Serial.print("Call indicator: A0 (GPIO"); Serial.print(callIndicatorPin); Serial.println(")");
-  Serial.print("Voltage threshold: "); Serial.println(normalVoltageThreshold);
+  Serial.print("Voltage threshold: "); Serial.println(settings.callThreshold);
+  Serial.print("Camera time: "); Serial.print(settings.cameraActivationTime); Serial.println("ms");
+  Serial.print("Door time: "); Serial.print(settings.doorActivationTime); Serial.println("ms");
+  Serial.print("Debounce time: "); Serial.print(settings.callDebounceTime); Serial.println("ms");
   Serial.println("⚠️  Verify GPIO pins match your hardware wiring!");
   
-  // Проверяем начальное состояние индикатора вызова
+  // Check initial state of call indicator
   int initialVoltage = analogRead(callIndicatorPin);
   Serial.print("Initial A0 reading: "); Serial.println(initialVoltage);
   
-  // Тест GPIO пинов - кратковременное мигание для проверки
+  // GPIO pin test - brief flash for verification
   Serial.println("🧪 Testing GPIO pins (brief flash)...");
   digitalWrite(cameraPin, !digitalRead(cameraPin)); delay(100);
   digitalWrite(cameraPin, !digitalRead(cameraPin));
@@ -298,116 +460,153 @@ void setup() {
   digitalWrite(doorPin, !digitalRead(doorPin));
   Serial.println("✅ GPIO pin test completed");
 
-  // Connect to Wi-Fi
-  Serial.println("=== WiFi CONNECTION DEBUG ===");
-  Serial.print("MAC Address: "); Serial.println(WiFi.macAddress());
+  // WiFiManager setup - automatic connection or web portal
+  Serial.println("=== WiFiManager SETUP ===");
+  WiFiManager wifiManager;
   
-  #ifdef ESP8266
-    WiFi.setSleepMode(WIFI_NONE_SLEEP);
-  #endif
-  WiFi.mode(WIFI_STA);
+  // Uncomment to reset WiFi settings (for testing)
+  // wifiManager.resetSettings();
   
-  Serial.print("Attempting to connect to SSID: "); Serial.println(ssid);
-  WiFi.begin(ssid, password);
+  // Set custom hostname for the device
+  wifiManager.setHostname("intercom-telegram");
   
-  int attempts = 0;
-  const int maxAttempts = 30; // 30 секунд timeout
-  
-  while (WiFi.status() != WL_CONNECTED && attempts < maxAttempts) {
-    delay(1000);
-    attempts++;
-    Serial.print("Connecting to WiFi.. Attempt ");
-    Serial.print(attempts);
-    Serial.print("/");
-    Serial.print(maxAttempts);
-    Serial.print(" - Status: ");
+  // Try to connect to saved WiFi or start captive portal
+  Serial.println("🔗 Starting WiFiManager...");
+  if (!wifiManager.autoConnect("IntercomSetup", "12345678")) {
+    Serial.println("❌ Failed to connect or setup portal timeout");
+    Serial.println("Restarting device...");
     
-    switch (WiFi.status()) {
-      case WL_IDLE_STATUS:
-        Serial.println("IDLE");
-        break;
-      case WL_NO_SSID_AVAIL:
-        Serial.println("NO_SSID_AVAILABLE");
-        break;
-      case WL_SCAN_COMPLETED:
-        Serial.println("SCAN_COMPLETED");
-        break;
-      case WL_CONNECT_FAILED:
-        Serial.println("CONNECT_FAILED");
-        break;
-      case WL_CONNECTION_LOST:
-        Serial.println("CONNECTION_LOST");
-        break;
-      case WL_DISCONNECTED:
-        Serial.println("DISCONNECTED");
-        break;
-      default:
-        Serial.println("UNKNOWN");
-        break;
-    }
+    // Indicate WiFi error with LED (1 blink = WiFi failure)
+    indicateError(1, 5);  // 1 blink, repeat 5 times
+    
+    delay(1000);
+    ESP.restart();
   }
   
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("✅ WiFi connected successfully!");
-    Serial.print("IP address: "); Serial.println(WiFi.localIP());
-    Serial.print("Gateway: "); Serial.println(WiFi.gatewayIP());
-    Serial.print("Subnet: "); Serial.println(WiFi.subnetMask());
-    Serial.print("DNS: "); Serial.println(WiFi.dnsIP());
-    Serial.print("RSSI: "); Serial.print(WiFi.RSSI()); Serial.println(" dBm");
+  Serial.println("✅ WiFi connected successfully!");
+  Serial.print("IP address: "); Serial.println(WiFi.localIP());
+  Serial.print("Gateway: "); Serial.println(WiFi.gatewayIP());
+  Serial.print("Subnet: "); Serial.println(WiFi.subnetMask());
+  Serial.print("DNS: "); Serial.println(WiFi.dnsIP());
+  Serial.print("RSSI: "); Serial.print(WiFi.RSSI()); Serial.println(" dBm");
+
+  // Setup mDNS responder
+  if (MDNS.begin("intercom")) {
+    Serial.println("🌐 mDNS responder started");
+    Serial.println("Access device at: http://intercom.local/");
+    MDNS.addService("http", "tcp", 80);
   } else {
-    Serial.println("❌ WiFi connection FAILED!");
-    Serial.println("Scanning for available networks...");
-    
-    // Сканируем доступные сети
-    int networks = WiFi.scanNetworks();
-    if (networks == 0) {
-      Serial.println("No networks found");
-    } else {
-      Serial.print(networks);
-      Serial.println(" networks found:");
-      for (int i = 0; i < networks; ++i) {
-        Serial.print(i + 1);
-        Serial.print(": ");
-        Serial.print(WiFi.SSID(i));
-        Serial.print(" (");
-        Serial.print(WiFi.RSSI(i));
-        Serial.print(" dBm) ");
-        Serial.print(WiFi.encryptionType(i) == 7 ? "Open" : "Secured");
-        
-        // Проверяем, совпадает ли с нашим SSID
-        if (WiFi.SSID(i) == String(ssid)) {
-          Serial.print(" ← TARGET NETWORK FOUND!");
-        }
-        Serial.println();
-      }
-    }
-    
-    Serial.println("TROUBLESHOOTING:");
-    Serial.println("1. Check SSID spelling and case sensitivity");
-    Serial.println("2. Ensure network is 2.4GHz (ESP8266 doesn't support 5GHz)");
-    Serial.println("3. Check if network is hidden");
-    Serial.println("4. Verify signal strength");
-    Serial.println("Device will continue without WiFi...");
+    Serial.println("❌ Error setting up mDNS responder");
   }
 
-  // TLS setup - более агрессивное упрощение для ESP8266
+  // TLS setup - more aggressive simplification for ESP8266
   Serial.println("🔒 Setting up TLS/SSL...");
   #ifdef ESP8266
     client.setInsecure(); // simplify TLS for ESP8266
-    client.setTimeout(10000); // 10 секунд таймаут
+    client.setTimeout(10000); // 10 seconds timeout
     Serial.println("✅ Using insecure TLS with 10s timeout");
   #else
     client.setCACert(TELEGRAM_CERTIFICATE_ROOT);
     Serial.println("✅ Using certificate validation for ESP32");
   #endif
 
-  // Настройка Telegram
+  // Web server and OTA setup
+  Serial.println("=== WEB SERVER & OTA SETUP ===");
+  
+  // Main page
+  server.on("/", []() {
+    String page = "<html><head><meta charset='UTF-8'><title>Intercom Control</title></head><body>";
+    page += "<h1>🏠 Telegram Intercom System</h1>";
+    page += "<p>IP: " + WiFi.localIP().toString() + "</p>";
+    page += "<p>Status: " + String(WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected") + "</p>";
+    page += "<p><a href='/settings'>⚙️ Settings</a></p>";
+    page += "<p><a href='/update'>🔄 OTA Update</a></p>";
+    page += "</body></html>";
+    server.send(200, "text/html; charset=UTF-8", page);
+  });
+
+  // Settings page
+  server.on("/settings", HTTP_GET, []() {
+    String page = "<html><head><meta charset='UTF-8'><title>Intercom Settings</title></head><body>";
+    page += "<h2>⚙️ Intercom Configuration</h2>";
+    page += "<form method='POST'>";
+    page += "Camera activation time (ms): <input type='number' name='camera' value='" + String(settings.cameraActivationTime) + "'><br><br>";
+    page += "Call threshold (A0): <input type='number' name='threshold' value='" + String(settings.callThreshold) + "'><br><br>";
+    page += "Call debounce time (ms): <input type='number' name='debounce' value='" + String(settings.callDebounceTime) + "'><br><br>";
+    page += "Door activation time (ms): <input type='number' name='door' value='" + String(settings.doorActivationTime) + "'><br><br>";
+    page += "<input type='submit' value='💾 Save Settings'>";
+    page += "</form>";
+    page += "<p><a href='/'>🔙 Back to Home</a></p>";
+    page += "</body></html>";
+    server.send(200, "text/html; charset=UTF-8", page);
+  });
+
+  // Handle settings POST request
+  server.on("/settings", HTTP_POST, []() {
+    bool changed = false;
+    
+    if (server.hasArg("camera")) {
+      settings.cameraActivationTime = constrain(server.arg("camera").toInt(), 100, 10000);
+      changed = true;
+    }
+    if (server.hasArg("threshold")) {
+      settings.callThreshold = constrain(server.arg("threshold").toInt(), 0, 1023);
+      changed = true;
+    }
+    if (server.hasArg("debounce")) {
+      settings.callDebounceTime = constrain(server.arg("debounce").toInt(), 1000, 60000);
+      changed = true;
+    }
+    if (server.hasArg("door")) {
+      settings.doorActivationTime = constrain(server.arg("door").toInt(), 50, 5000);
+      changed = true;
+    }
+
+    if (changed) {
+      saveSettings();
+      Serial.println("⚙️ Settings updated via web interface");
+    }
+
+    server.sendHeader("Location", "/settings");
+    server.send(303);
+  });
+
+  // 404 handler
+  server.onNotFound([]() {
+    server.send(404, "text/plain", "Page not found!");
+  });
+
+  // Initialize ElegantOTA
+  ElegantOTA.begin(&server);
+  ElegantOTA.onStart(onOTAStart);
+  ElegantOTA.onProgress(onOTAProgress);
+  ElegantOTA.onEnd(onOTAEnd);
+
+  // Start web server
+  server.begin();
+  Serial.println("🌐 HTTP server started at http://" + WiFi.localIP().toString());
+  Serial.println("⚙️ Settings: http://intercom.local/settings");
+  Serial.println("🔄 OTA Update: http://intercom.local/update");
+
+  // Telegram setup
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("=== TELEGRAM SETUP ===");
     Serial.print("💾 Free heap: "); Serial.print(ESP.getFreeHeap()); Serial.println(" bytes");
     
-    // Отправляем стартовое уведомление
-    String startupMsg = "🏠 Домофон бот запущен!\nIP: " + WiFi.localIP().toString() + "\n\nСистема готова к работе!";
+    // Send startup notification with reset reason
+    String resetReason = ESP.getResetReason();
+    String startupMsg = "🏠 Intercom bot started!\n";
+    startupMsg += "IP: " + WiFi.localIP().toString() + "\n\n";
+    startupMsg += "📊 BOOT INFO:\n";
+    startupMsg += "🔄 Reset reason: " + resetReason + "\n";
+    startupMsg += "💾 Free memory: " + String(ESP.getFreeHeap()) + " bytes\n";
+    startupMsg += "⚡ CPU freq: " + String(ESP.getCpuFreqMHz()) + " MHz\n";
+    startupMsg += "📊 Boot count: " + String(settings.rebootCount) + "\n";
+    if (settings.lastUptime > 0) {
+      startupMsg += "⏱️ Last uptime: " + String(settings.lastUptime) + " min\n";
+    }
+    startupMsg += "\nSystem ready to work!";
+    
     bool sent = bot.sendMessageWithReplyKeyboard(CHAT_ID, startupMsg, "", replyKeyboard, true, false, false);
     Serial.print("📤 Startup notification: "); Serial.println(sent ? "✅ Sent" : "❌ Failed");
     
@@ -419,17 +618,22 @@ void setup() {
 }
 
 void loop() {
-  // Проверяем память каждые 30 секунд
+  // Handle web server and OTA
+  server.handleClient();
+  MDNS.update();
+  ElegantOTA.loop();
+  
+  // Check memory every 30 seconds
   static unsigned long lastMemCheck = 0;
   if (millis() - lastMemCheck > 30000) {
     Serial.print("💾 Free: "); Serial.print(ESP.getFreeHeap()); Serial.println(" bytes");
     lastMemCheck = millis();
   }
   
-  // Проверяем входящие вызовы
+  // Check incoming calls
   checkIncomingCall();
   
-  // Обработка Telegram сообщений
+  // Handle Telegram messages
   if (millis() > lastTimeBotRan + botRequestDelay) {
     int numNewMessages = bot.getUpdates(bot.last_message_received + 1);
     
@@ -441,49 +645,97 @@ void loop() {
     lastTimeBotRan = millis();
   }
   
-  // Serial commands для отладки
+  // Serial commands for debugging
   if (Serial.available()) {
     String command = Serial.readString();
     command.trim();
     
     if (command == "open") {
       Serial.println("🚪 Manual open via Serial");
-      // Эмулируем Telegram сообщение
-      Serial.println("🎥 Включаю камеру домофона...");
+      // Emulate Telegram message
+      Serial.println("🎥 Activating intercom camera...");
       pressCameraButton();
-      Serial.println("🚪 Открываю замок...");
+      Serial.println("🚪 Opening door lock...");
       delay(500);
       pressDoorButton();
-      Serial.println("✅ Домофон открыт!");
+      Serial.println("✅ Intercom opened!");
     } else if (command == "test") {
       bot.sendMessage(CHAT_ID, "Test message from Serial", "");
     } else if (command == "status") {
       Serial.print("💾 Memory: "); Serial.print(ESP.getFreeHeap()); Serial.println(" bytes");
       Serial.print("🌐 WiFi: "); Serial.println(WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected");
       Serial.print("📊 A0: "); Serial.print(analogRead(callIndicatorPin));
-      Serial.println(analogRead(callIndicatorPin) < normalVoltageThreshold ? " (CALL)" : " (NORMAL)");
+      Serial.println(analogRead(callIndicatorPin) < settings.callThreshold ? " (CALL)" : " (NORMAL)");
       Serial.print("🌐 IP: "); Serial.println(WiFi.localIP());
     }
   }
   
-  // Принудительная очистка памяти каждые 5 секунд
+  // Force memory cleanup every 5 seconds
   static unsigned long lastCleanup = 0;
   if (millis() - lastCleanup > 5000) {
     yield();
     lastCleanup = millis();
     
-    // Аварийная перезагрузка если памяти критически мало
+    // Emergency restart if critically low memory
     if (ESP.getFreeHeap() < 5000) {
       Serial.println("🚨 CRITICAL LOW MEMORY - RESTARTING...");
-      delay(1000);
+      
+      // Save current uptime before restart
+      settings.lastUptime = millis() / 60000;  // Convert to minutes
+      saveSettings();
+      
+      // Try to send Telegram alert if WiFi is connected
+      if (WiFi.status() == WL_CONNECTED) {
+        String alertMsg = "🚨 CRITICAL ALERT!\n\n";
+        alertMsg += "⚠️ Memory critically low: " + String(ESP.getFreeHeap()) + " bytes\n";
+        alertMsg += "⏱️ Uptime: " + String(millis() / 60000) + " min\n";
+        alertMsg += "🔄 System restarting automatically...\n";
+        alertMsg += "📍 IP: " + WiFi.localIP().toString();
+        
+        bool sent = bot.sendMessage(CHAT_ID, alertMsg, "");
+        Serial.print("📤 Critical alert sent: "); Serial.println(sent ? "✅ Success" : "❌ Failed");
+        delay(1000);
+      }
+      
+      // Always indicate error with LED (2 blinks = low memory)
+      indicateError(2, 3);  // 2 blinks, repeat 3 times
+      
       ESP.restart();
     }
   }
   
-  // Watchdog protection - перезапуск если система зависла надолго
+  // Watchdog protection - restart if system stuck for long time
   static unsigned long lastActivity = millis();
-  if (millis() - lastActivity > 300000) { // 5 минут без активности
+  
+  // Update activity time regularly (every time we process something)
+  if (millis() - lastTimeBotRan < botRequestDelay + 1000) {
+    lastActivity = millis();  // System is active if Telegram processing is working
+  }
+  
+  if (millis() - lastActivity > 300000) { // 5 minutes without activity
     Serial.println("🚨 SYSTEM STUCK - RESTARTING...");
+    
+    // Save current uptime before restart
+    settings.lastUptime = millis() / 60000;  // Convert to minutes
+    saveSettings();
+    
+    // Try to send Telegram alert if WiFi is connected
+    if (WiFi.status() == WL_CONNECTED) {
+      String stuckMsg = "🚨 CRITICAL ALERT!\n\n";
+      stuckMsg += "⏰ System stuck detected!\n";
+      stuckMsg += "🕐 No activity for 5+ minutes\n";
+      stuckMsg += "⏱️ Uptime: " + String(millis() / 60000) + " min\n";
+      stuckMsg += "🔄 System restarting automatically...\n";
+      stuckMsg += "📍 IP: " + WiFi.localIP().toString();
+      
+      bool sent = bot.sendMessage(CHAT_ID, stuckMsg, "");
+      Serial.print("📤 System stuck alert sent: "); Serial.println(sent ? "✅ Success" : "❌ Failed");
+      delay(1000);
+    }
+    
+    // Always indicate error with LED (3 blinks = system stuck)
+    indicateError(3, 3);  // 3 blinks, repeat 3 times
+    
     ESP.restart();
   }
 }
