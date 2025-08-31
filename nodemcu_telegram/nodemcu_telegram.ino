@@ -1,96 +1,35 @@
-/*
-  Telegram bot for intercom control via ESP8266/Wemos
-  
-  FUNCTIONALITY:
-  - Monitor incoming calls via analog input A0 (voltage divider)
-  - Automatic Telegram notifications on incoming calls
-  - Intercom control via "Open" command:
-    1. Press camera button (D1) for 2 seconds  
-    2. Press door lock button (D2) briefly
-  
-  CONNECTIONS:
-  - D1 (GPIO5) - PC817 optocoupler for camera button
-  - D2 (GPIO4) - PC817 optocoupler for door lock button  
-  - A0 - voltage divider from call indicator LED (2x10kOhm, divides 1.8V→0.9V)
-  - Built-in LED (GPIO2) - status indication
-  
-  COMMANDS:
-  - /start - main menu
-  - /status - system status and analog input
-  - "Open" - open intercom
-  
-  LED ERROR CODES:
-  - 1 blink  = WiFi connection failure
-  - 2 blinks = Critical low memory (< 5000 bytes)
-  - 3 blinks = System stuck (no activity 5+ minutes)
-  - 4 blinks = General error
-  - 5 blinks = Telegram connection error
-  
-  LED patterns repeat every 3 seconds when error occurs
-*/
-
-#ifdef ESP32
-  #include <WiFi.h>
-  #include <WebServer.h>
-#else
+#include <EEPROM.h>
+#include <WiFiManager.h>  // https://github.com/tzapu/WiFiManager WiFi Configuration Magic
   #include <ESP8266WiFi.h>
-  #include <ESP8266WebServer.h>
-#endif
 #include <WiFiClientSecure.h>
-#include <UniversalTelegramBot.h>
+#include <UniversalTelegramBot.h>   // Universal Telegram Bot Library
 #include <ArduinoJson.h>
-
-// WiFiManager and OTA libraries
-#include <DNSServer.h>
-#include <WiFiManager.h>
+#include <ESP8266WebServer.h>
 #include <ESP8266mDNS.h>
 #include <ElegantOTA.h>
-#include <EEPROM.h>
-// Local secrets (not committed). See secrets.example.h for the template
-#if defined(__has_include)
-  #if __has_include("../secrets.h")
-    #include "../secrets.h"
-    #define SECRETS_SOURCE "Real secrets from ../secrets.h"
-  #elif __has_include("secrets.h")
-    #include "secrets.h"
-    #define SECRETS_SOURCE "Real secrets from local secrets.h"
-  #else
-    #include "secrets.example.h"
-    #define SECRETS_SOURCE "Template from secrets.example.h - NO REAL SECRETS FOUND!"
-  #endif
-#else
-  #include "../secrets.h"
-  #define SECRETS_SOURCE "Direct include ../secrets.h"
-#endif
+#include <time.h>
+#include <coredecls.h>
 
-// Replace with your network credentials
-const char* ssid = WIFI_SSID;
-const char* password = WIFI_PASSWORD;
+// PROGMEM для статических строк (экономия RAM)
+const char PROGMEM_HELP_MSG[] PROGMEM = "📋 === AVAILABLE COMMANDS ===\nping        - Test Serial communication\nmemtest     - Memory diagnostic test\nfreemem     - Emergency memory recovery\nopen        - Manual intercom open\ntest        - Send test Telegram message\nstatus      - Show full system status\nrestart     - Restart system\ncleanup     - Force memory cleanup\nresetwifi   - Reset WiFi settings\nwifiportal  - Start WiFi config portal\nforcereset  - FORCE clear ALL WiFi data\nscanwifi    - Scan WiFi networks\nhelp/?      - Show this help\n============================";
 
-// Initialize Telegram BOT
-#define BOTtoken BOT_TOKEN  // your Bot Token (from BotFather)
+const char PROGMEM_SYSTEM_STARTUP[] PROGMEM = "=== SYSTEM STARTUP ===";
+const char PROGMEM_MEMORY_CHECK[] PROGMEM = "💾 === MEMORY HEALTH CHECK ===";
+const char PROGMEM_CRITICAL_MEM[] PROGMEM = "🚨 CRITICAL MEMORY - FORCING AGGRESSIVE CLEANUP!";
 
-// Use @myidbot to find out the chat ID of an individual or a group
-// Also note that you need to click "start" on a bot before it can message you
-// CHAT_ID now defined in secrets.h
+// Include secrets
+#include "secrets.h"
 
-WiFiClientSecure client;
-UniversalTelegramBot bot(BOT_TOKEN, client);
+// Hardware configuration
+const int callIndicatorPin = A0;    // Analog pin for call detection
+const int cameraButtonPin = D5;     // Camera activation button
+const int doorButtonPin = D6;       // Door lock activation button
+const int ledPin = LED_BUILTIN;     // Built-in LED for status indication
 
-// Web server and OTA setup
-#ifdef ESP32
-  WebServer server(80);
-#else
-  ESP8266WebServer server(80);
-#endif
+// Optocoupler configuration
+const bool optocouplerActiveHigh = false;  // false = active LOW, true = active HIGH
 
-unsigned long ota_progress_millis = 0;
-
-// Polling period (ms)
-int botRequestDelay = 2000;
-unsigned long lastTimeBotRan;
-
-// EEPROM settings structure
+// Settings structure for EEPROM
 struct IntercomSettings {
   int cameraActivationTime;    // Camera activation time in ms
   int callThreshold;          // Threshold value for A0
@@ -100,644 +39,1470 @@ struct IntercomSettings {
   char chatId[20];            // Telegram Chat ID
   unsigned long rebootCount;   // Count of system reboots
   unsigned long lastUptime;    // Last uptime before reboot (minutes)
+  int watchdogTimeout;        // Hardware watchdog timeout in seconds
 };
 
 IntercomSettings settings;
-const int EEPROM_ADDR = 0;
 
-// GPIO for onboard LED (optional)
-const int ledPin = 2;
-bool ledState = LOW;
+// Telegram Bot Setup
+WiFiClientSecure client;
+UniversalTelegramBot bot(BOT_TOKEN, client);
 
-// Intercom configuration
-const int cameraPin = 5;       // GPIO5 (D1 on Wemos) - camera activation button 
-const int doorPin = 4;         // GPIO4 (D2 on Wemos) - door lock button
-const bool optocouplerActiveHigh = false; // PC817 optocouplers are usually active LOW
+// Web server
+ESP8266WebServer server(80);
 
-// Call detection configuration
-const int callIndicatorPin = A0;  // Analog input for call monitoring
-// Settings below are loaded from EEPROM or use default values
+// Telegram and connectivity variables
+bool telegramConnected = false;
+unsigned long lastTelegramCheck = 0;
+unsigned long telegramReconnectAttempts = 0;
+unsigned long lastSuccessfulMessage = 0;
+unsigned long lastTimeBotRan = 0;
+const unsigned long botRequestDelay = 1000;
 
-// Call detection variables
+// Auto port testing
+bool autoPortTestCompleted = false;
+int workingTelegramPort = 433;  // Default port
+
+// Call detection
 bool callDetected = false;
 bool lastCallState = false;
 unsigned long lastCallTime = 0;
 
-// Reply keyboard with one "Open" button (persistent chat menu)
-static const char replyKeyboard[] = "[[\"Open\"]]";
+// Memory monitoring
+unsigned long lastMemoryCheck = 0;
+const unsigned long MEMORY_CHECK_INTERVAL = 5000; // Check every 5 seconds
+uint32_t minFreeHeap = 0xFFFFFFFF; // Track minimum free heap
 
-// ========== LED ERROR INDICATION FUNCTIONS ==========
+// Advanced Watchdog System
+unsigned long lastLoopTime = 0;
+unsigned long lastTelegramActivity = 0;
+unsigned long lastWiFiCheck = 0;
+const unsigned long MAX_LOOP_TIME = 10000;      // Max 10 seconds per loop
+const unsigned long MAX_TELEGRAM_SILENCE = 300000; // Max 5 minutes without Telegram
+const unsigned long CRITICAL_MEMORY_THRESHOLD = 20000; // Critical memory level
+unsigned long softwareWatchdogCounter = 0;
+bool criticalOperationInProgress = false;
 
-// Blink built-in LED with error code (number of blinks)
-void blinkErrorCode(int errorCode) {
-  const int blinkDuration = 200;    // Short blink duration
-  const int pauseBetween = 300;     // Pause between blinks
-  const int pauseAfter = 2000;      // Pause after sequence
+// Time synchronization
+bool timeInitialized = false;
+time_t now;
+const char* ntpServer1 = "pool.ntp.org";
+const long gmtOffset_sec = 0;
+const int daylightOffset_sec = 0;
+
+// ========== MEMORY MANAGEMENT ==========
+
+void checkMemoryHealth() {
+  uint32_t currentFree = ESP.getFreeHeap();
+  uint16_t fragmentation = ESP.getHeapFragmentation();
+  uint32_t maxFreeBlock = ESP.getMaxFreeBlockSize();
   
-  Serial.print("🚨 LED Error Code: "); Serial.print(errorCode); Serial.println(" blinks");
+  // Track minimum heap
+  if (currentFree < minFreeHeap) {
+    minFreeHeap = currentFree;
+  }
   
-  for (int i = 0; i < errorCode; i++) {
-    digitalWrite(ledPin, LOW);   // Turn LED ON (built-in LED is active LOW)
-    delay(blinkDuration);
-    digitalWrite(ledPin, HIGH);  // Turn LED OFF
+  // Log memory status every 30 seconds
+  if (millis() - lastMemoryCheck > MEMORY_CHECK_INTERVAL) {
+    Serial.println(FPSTR(PROGMEM_MEMORY_CHECK));
+    Serial.println("Current free: " + String(currentFree) + " bytes");
+    Serial.println("Minimum free: " + String(minFreeHeap) + " bytes");
+    Serial.println("Fragmentation: " + String(fragmentation) + "%");
+    Serial.println("Max free block: " + String(maxFreeBlock) + " bytes");
     
-    if (i < errorCode - 1) {     // Pause between blinks (except after last)
-      delay(pauseBetween);
+    if (currentFree < 20000) {
+      Serial.println("⚠️ LOW MEMORY WARNING!");
+      forceMemoryCleanup(); // Cleanup much earlier
+    }
+    if (fragmentation > 30) {
+      Serial.println("⚠️ HIGH FRAGMENTATION WARNING!");
+      forceMemoryCleanup(); // Cleanup on high fragmentation
+    }
+    if (currentFree < 15000) {
+      Serial.println("🚨 CRITICAL MEMORY - FORCING AGGRESSIVE CLEANUP!");
+      
+      // Force aggressive cleanup
+      for (int i = 0; i < 10; i++) {
+        yield();
+        ESP.wdtFeed();
+        delay(10);
+      }
+      
+      uint32_t afterCleanup = ESP.getFreeHeap();
+      Serial.println("💾 After cleanup: " + String(afterCleanup) + " bytes");
+      
+      // Emergency restart if cleanup failed
+      if (afterCleanup < 12000) {
+        Serial.println("🚨 EMERGENCY: Memory cleanup failed - RESTARTING!");
+        emergencyRestart("Critical memory after cleanup");
+      }
+    }
+    
+    // Force restart if memory gets dangerously low
+    if (currentFree < 8000) {
+      Serial.println("🚨 EMERGENCY: Memory dangerously low - FORCING RESTART!");
+      emergencyRestart("Dangerously low memory");
+    }
+    
+    lastMemoryCheck = millis();
+  }
+}
+
+// Force memory cleanup when needed
+void forceMemoryCleanup() {
+  Serial.println("🧹 Forcing aggressive memory cleanup...");
+  
+  uint32_t beforeCleanup = ESP.getFreeHeap();
+  
+  // More aggressive cleanup cycles
+  for (int i = 0; i < 20; i++) {
+    yield();
+    ESP.wdtFeed();
+    delay(10);
+  }
+  
+  // Force garbage collection
+  delay(100);
+  
+  // Additional cleanup cycles
+  for (int i = 0; i < 10; i++) {
+    yield();
+    ESP.wdtFeed();
+    delay(5);
+  }
+  
+  delay(200);  // Allow system cleanup
+  uint32_t afterCleanup = ESP.getFreeHeap();
+  
+  int recovered = afterCleanup - beforeCleanup;
+  // Разбиваем сложную конкатенацию
+  Serial.print("💾 Memory: "); 
+  Serial.print(beforeCleanup); 
+  Serial.print(" -> "); 
+  Serial.print(afterCleanup); 
+  Serial.print(" (+"); 
+  Serial.print(recovered); 
+  Serial.println(" bytes)");
+  
+  // If cleanup didn't help much, something is wrong
+  if (recovered < 100 && afterCleanup < 15000) {
+    Serial.println("⚠️ WARNING: Memory cleanup ineffective!");
+  }
+}
+
+// ========== ADVANCED WATCHDOG SYSTEM ==========
+
+void softwareWatchdogFeed() {
+  softwareWatchdogCounter++;
+  lastLoopTime = millis();
+  ESP.wdtFeed(); // Hardware watchdog
+  
+  // Log every 1000 feeds (about every 100 seconds in normal operation)
+  if (softwareWatchdogCounter % 1000 == 0) {
+    Serial.println("🐕 Watchdog: " + String(softwareWatchdogCounter) + " feeds");
+  }
+}
+
+void beginCriticalOperation(const char* operationName) {
+  criticalOperationInProgress = true;
+  Serial.println("🔒 Beginning critical operation: " + String(operationName));
+  
+  // Pre-operation memory check
+  uint32_t freeMem = ESP.getFreeHeap();
+  if (freeMem < CRITICAL_MEMORY_THRESHOLD) {
+    Serial.println("🚨 CRITICAL: Starting operation with low memory!");
+    forceMemoryCleanup();
+  }
+  
+  softwareWatchdogFeed();
+}
+
+void endCriticalOperation(const char* operationName) {
+  criticalOperationInProgress = false;
+  Serial.println("✅ Completed critical operation: " + String(operationName));
+  
+  // Post-operation memory check
+  uint32_t freeMem = ESP.getFreeHeap();
+  Serial.println("💾 Memory after operation: " + String(freeMem) + " bytes");
+  
+  softwareWatchdogFeed();
+}
+
+void checkSystemHealth() {
+  unsigned long currentTime = millis();
+  
+  // Check for loop hang (more than 10 seconds without loop iteration)
+  if (currentTime - lastLoopTime > MAX_LOOP_TIME) {
+    Serial.println("🚨 SYSTEM HANG DETECTED - FORCING RESTART!");
+    Serial.println("Last loop was " + String((currentTime - lastLoopTime) / 1000) + " seconds ago");
+    
+    // Try to send emergency message before restart
+    if (telegramConnected) {
+      bot.sendMessage(CHAT_ID, "🚨 EMERGENCY: System hang detected, restarting...", "");
+      delay(1000); // Give time to send
+    }
+    
+    ESP.restart();
+  }
+  
+  // Check for memory leaks
+  uint32_t currentFree = ESP.getFreeHeap();
+  if (currentFree < CRITICAL_MEMORY_THRESHOLD) {
+    Serial.println("🚨 CRITICAL MEMORY LEAK DETECTED!");
+    Serial.println("Free memory: " + String(currentFree) + " bytes");
+    
+    // Emergency cleanup
+    forceMemoryCleanup();
+    
+    currentFree = ESP.getFreeHeap();
+    if (currentFree < CRITICAL_MEMORY_THRESHOLD) {
+      Serial.println("🚨 MEMORY CLEANUP FAILED - FORCING RESTART!");
+      
+      // Emergency restart
+      if (telegramConnected) {
+        bot.sendMessage(CHAT_ID, "🚨 EMERGENCY: Critical memory leak, restarting...", "");
+        delay(1000);
+      }
+      ESP.restart();
     }
   }
   
-  delay(pauseAfter);  // Pause after complete sequence
-}
-
-// Continuous error indication with specified code
-void indicateError(int errorCode, int repeatTimes = 3) {
-  Serial.print("🚨 Indicating error code "); Serial.print(errorCode);
-  Serial.print(" ("); Serial.print(repeatTimes); Serial.println(" times)");
-  
-  for (int i = 0; i < repeatTimes; i++) {
-    blinkErrorCode(errorCode);
+  // Check WiFi health
+  if (currentTime - lastWiFiCheck > 60000) { // Check every minute
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("⚠️ WiFi disconnected - attempting reconnection");
+      WiFi.reconnect();
+    }
+    lastWiFiCheck = currentTime;
   }
-}
-
-// ========== EEPROM AND SETTINGS FUNCTIONS ==========
-
-void saveSettings() {
-  EEPROM.put(EEPROM_ADDR, settings);
-  EEPROM.commit();
-  Serial.println("⚙️ Settings saved to EEPROM");
-}
-
-void loadSettings() {
-  EEPROM.get(EEPROM_ADDR, settings);
-
-  // Validate settings (check if values are reasonable)
-  if (settings.cameraActivationTime < 100 || settings.cameraActivationTime > 10000) {
-    // Load default settings
-    settings.cameraActivationTime = 2000;  // 2 seconds for camera
-    settings.callThreshold = 200;          // A0 threshold value
-    settings.callDebounceTime = 5000;      // 5 seconds debounce
-    settings.doorActivationTime = 200;     // 200ms for door lock
-    strncpy(settings.botToken, BOT_TOKEN, sizeof(settings.botToken) - 1);
-    strncpy(settings.chatId, CHAT_ID, sizeof(settings.chatId) - 1);
-    settings.rebootCount = 1;              // First boot
-    settings.lastUptime = 0;               // No previous uptime
+  
+  // Check Telegram silence (no activity for too long)
+  if (telegramConnected && (currentTime - lastTelegramActivity > MAX_TELEGRAM_SILENCE)) {
+    Serial.println("⚠️ Telegram silent for too long - testing connection");
     
-    Serial.println("⚙️ Loading default settings");
-    saveSettings();
+    // Test Telegram connection
+    if (!testTelegramConnectivity()) {
+      telegramConnected = false;
+      Serial.println("💬 Telegram connection lost");
+    }
+  }
+}
+
+void emergencyRestart(const char* reason) {
+  Serial.println("🚨 EMERGENCY RESTART: " + String(reason));
+  
+  // Try to save critical state
+  settings.lastUptime = millis() / 60000;
+  saveSettings();
+  
+  // Try to send emergency notification
+  if (telegramConnected) {
+    String emergencyMsg = "🚨 EMERGENCY RESTART\n\nReason: ";
+    emergencyMsg += reason;
+    emergencyMsg += "\nUptime: " + String(millis() / 60000) + " min";
+    emergencyMsg += "\nMemory: " + String(ESP.getFreeHeap()) + " bytes";
+    
+    bot.sendMessage(CHAT_ID, emergencyMsg, "");
+    delay(2000); // Give time to send
+  }
+  
+  ESP.restart();
+}
+
+// ========== AUTO PORT DETECTION ==========
+
+bool autoDetectTelegramPort() {
+  Serial.println("🔍 Auto-detecting working Telegram port...");
+  
+  // Test HTTPS ports in order of preference (Livebox 6 often blocks 443)
+  int testPorts[] = {443, 8443, 80};
+  int numPorts = sizeof(testPorts) / sizeof(testPorts[0]);
+  
+  for (int i = 0; i < numPorts; i++) {
+    Serial.print("Testing port " + String(testPorts[i]) + "... ");
+    
+    WiFiClientSecure testClient;
+    testClient.setInsecure();  // Required for Livebox 6 router compatibility
+    
+    unsigned long start = millis();
+    if (testClient.connect("api.telegram.org", testPorts[i])) {
+      unsigned long duration = millis() - start;
+      Serial.println("✅ Success in " + String(duration) + " ms");
+      
+      workingTelegramPort = testPorts[i];
+      testClient.stop();
+      
+      Serial.println("🎯 Using Telegram port: " + String(workingTelegramPort));
+      return true;
+    } else {
+      unsigned long duration = millis() - start;
+      Serial.println("❌ Failed after " + String(duration) + " ms");
+    }
+    
+    delay(1000);
+  }
+  
+  Serial.println("⚠️ All HTTPS ports failed - using default 443");
+  Serial.println("💡 Livebox 6 may be blocking SSL handshake");
+  Serial.println("💡 Try: Mobile hotspot, router reboot, or different network");
+  workingTelegramPort = 443;
+  return false;
+}
+
+// ========== TIME FUNCTIONS ==========
+
+bool initializeNTP() {
+  Serial.println("🕐 Initializing NTP time synchronization...");
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer1);
+  
+  // Wait for time sync
+  unsigned long start = millis();
+  while (millis() - start < 10000) {
+    time(&now);
+    if (now > 1000000000) {
+      timeInitialized = true;
+      Serial.println("✅ NTP synchronization successful");
+      return true;
+    }
+    delay(500);
+    ESP.wdtFeed();
+  }
+  
+  Serial.println("❌ NTP synchronization failed");
+  return false;
+}
+
+bool isTimeValid() {
+  time(&now);
+  return (now > 1000000000 && timeInitialized);
+}
+
+// ========== TELEGRAM FUNCTIONS ==========
+
+bool testTelegramConnectivity() {
+  Serial.println("📡 Testing Telegram API connectivity...");
+  Serial.println("🔓 Using insecure SSL for Livebox 6 router compatibility...");
+  
+  // Check time first
+  if (!isTimeValid()) {
+    Serial.println("⚠️ System time invalid - attempting quick sync...");
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer1);
+    delay(2000);
+    time(&now);
+    if (now > 1000000000) {
+      timeInitialized = true;
+      Serial.println("✅ Time sync successful");
+    }
+  }
+  
+  // Use simple SSL approach with minimal Livebox 6 compatibility
+  WiFiClientSecure testClient;
+  testClient.setInsecure();  // Required for Livebox 6 router compatibility
+  
+  Serial.print("🔗 Connecting to api.telegram.org:" + String(workingTelegramPort) + "... ");
+  unsigned long connectStart = millis();
+  
+  if (testClient.connect("api.telegram.org", workingTelegramPort)) {
+    unsigned long connectTime = millis() - connectStart;
+    Serial.println("✅ Connected in " + String(connectTime) + " ms");
+    
+    // Test API call
+    testClient.print("GET /bot");
+    testClient.print(BOT_TOKEN);
+    testClient.println("/getMe HTTP/1.1");
+    testClient.println("Host: api.telegram.org");
+    testClient.println("Connection: close");
+    testClient.println();
+    
+    // Wait for response
+    unsigned long timeout = millis() + 10000;
+    while (testClient.available() == 0 && millis() < timeout) {
+      delay(100);
+      ESP.wdtFeed();
+    }
+    
+    if (testClient.available()) {
+      String response = testClient.readStringUntil('\n');
+      testClient.stop();
+      
+      if (response.indexOf("200 OK") >= 0) {
+        Serial.println("✅ API test successful");
+        return true;
+      } else {
+        Serial.println("⚠️ Connected but API failed");
+      }
+    } else {
+      Serial.println("⚠️ Connected but no API response");
+      testClient.stop();
+    }
   } else {
-    // Update reboot statistics
-    settings.lastUptime = millis() / 60000;  // Previous uptime in minutes (will be 0 on first boot)
-    settings.rebootCount++;
-    Serial.println("⚙️ Settings loaded from EEPROM");
-    Serial.print("📊 Boot count: "); Serial.println(settings.rebootCount);
-    Serial.print("⏱️ Last uptime: "); Serial.print(settings.lastUptime); Serial.println(" minutes");
-    saveSettings(); // Save updated boot count
+    unsigned long connectTime = millis() - connectStart;
+    Serial.println("❌ Failed after " + String(connectTime) + " ms");
   }
+  
+  return false;
 }
 
-// ========== OTA CALLBACK FUNCTIONS ==========
-
-void onOTAStart() {
-  Serial.println("🔄 OTA update started!");
-  // Disable intercom during update
-}
-
-void onOTAProgress(size_t current, size_t final) {
-  if (millis() - ota_progress_millis > 1000) {
-    ota_progress_millis = millis();
-    Serial.printf("🔄 OTA Progress: %u/%u bytes (%.1f%%)\n", 
-                  current, final, (float)current / final * 100);
+bool reconnectTelegram() {
+  Serial.println("🔄 Attempting Telegram reconnection...");
+  telegramReconnectAttempts++;
+  
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("❌ WiFi not connected");
+    return false;
   }
-}
-
-void onOTAEnd(bool success) {
-  if (success) {
-    Serial.println("✅ OTA update finished successfully!");
+  
+  if (!testTelegramConnectivity()) {
+    Serial.println("❌ Reconnection failed (attempt " + String(telegramReconnectAttempts) + ")");
+    return false;
+  }
+  
+  // Send test message
+  String testMsg = "🔄 Telegram reconnected!\nAttempt: " + String(telegramReconnectAttempts);
+  testMsg += "\nUptime: " + String(millis() / 60000) + " min";
+  
+  bool sent = bot.sendMessage(CHAT_ID, testMsg, "");
+  if (sent) {
+    Serial.println("✅ Reconnected successfully (attempt " + String(telegramReconnectAttempts) + ")");
+    telegramConnected = true;
+    lastSuccessfulMessage = millis();
+    return true;
   } else {
-    Serial.println("❌ OTA update failed!");
+    Serial.println("❌ Test message failed (attempt " + String(telegramReconnectAttempts) + ")");
+    return false;
   }
 }
 
-// Function to press camera button (timing from settings)
+// ========== HARDWARE FUNCTIONS ==========
+
 void pressCameraButton() {
-  Serial.println("🎥 === CAMERA BUTTON PRESS START ===");
-  Serial.print("Setting pin "); Serial.print(cameraPin); 
-  Serial.print(" to "); Serial.println(optocouplerActiveHigh ? "HIGH" : "LOW");
-  Serial.print("Duration: "); Serial.print(settings.cameraActivationTime); Serial.println("ms");
+  Serial.println("🎥 === CAMERA BUTTON PRESS ===");
+  Serial.println("Changing camera pin " + String(cameraButtonPin) + " to " + String(optocouplerActiveHigh ? "HIGH" : "LOW"));
   
-  digitalWrite(cameraPin, optocouplerActiveHigh ? HIGH : LOW);
-  delay(settings.cameraActivationTime); // Time from settings
-  digitalWrite(cameraPin, optocouplerActiveHigh ? LOW : HIGH);
+  digitalWrite(cameraButtonPin, optocouplerActiveHigh ? HIGH : LOW);
+  delay(settings.cameraActivationTime);
+  digitalWrite(cameraButtonPin, optocouplerActiveHigh ? LOW : HIGH);
   
-  Serial.print("Setting pin "); Serial.print(cameraPin); 
-  Serial.print(" to "); Serial.println(optocouplerActiveHigh ? "LOW" : "HIGH");
+  Serial.println("Changing camera pin " + String(cameraButtonPin) + " to " + String(optocouplerActiveHigh ? "LOW" : "HIGH"));
   Serial.println("🎥 === CAMERA BUTTON RELEASE ===");
 }
 
-// Function for brief door lock button press (timing from settings)
 void pressDoorButton() {
-  Serial.println("🚪 === DOOR BUTTON PRESS START ===");
-  Serial.print("Setting pin "); Serial.print(doorPin); 
-  Serial.print(" to "); Serial.println(optocouplerActiveHigh ? "HIGH" : "LOW");
-  Serial.print("Duration: "); Serial.print(settings.doorActivationTime); Serial.println("ms");
+  Serial.println("🚪 === DOOR BUTTON PRESS ===");
+  Serial.println("Changing door pin " + String(doorButtonPin) + " to " + String(optocouplerActiveHigh ? "HIGH" : "LOW"));
   
-  digitalWrite(doorPin, optocouplerActiveHigh ? HIGH : LOW);
-  delay(settings.doorActivationTime); // Time from settings
-  digitalWrite(doorPin, optocouplerActiveHigh ? LOW : HIGH);
+  digitalWrite(doorButtonPin, optocouplerActiveHigh ? HIGH : LOW);
+  delay(settings.doorActivationTime);
+  digitalWrite(doorButtonPin, optocouplerActiveHigh ? LOW : HIGH);
   
-  Serial.print("Setting pin "); Serial.print(doorPin); 
-  Serial.print(" to "); Serial.println(optocouplerActiveHigh ? "LOW" : "HIGH");
+  Serial.println("Changing door pin " + String(doorButtonPin) + " to " + String(optocouplerActiveHigh ? "LOW" : "HIGH"));
   Serial.println("🚪 === DOOR BUTTON RELEASE ===");
 }
 
-// Complete intercom opening sequence
 void openIntercom() {
-  Serial.println("=== Starting intercom opening sequence ===");
+  beginCriticalOperation("Intercom Opening");
   
-  // First activate camera
+  // Check memory before each critical step
+  uint32_t freeMem = ESP.getFreeHeap();
+  if (freeMem < CRITICAL_MEMORY_THRESHOLD) {
+    Serial.println("🚨 CRITICAL MEMORY - Aborting intercom operation!");
+    endCriticalOperation("Intercom Opening - ABORTED");
+    return;
+  }
+  
   pressCameraButton();
   
-  // Small pause between operations
-  delay(500);
+  // Safe delay with watchdog feeding and memory check
+  softwareWatchdogFeed();
+  yield();
   
-  // Then open door lock
+  // Check memory again before second operation
+  freeMem = ESP.getFreeHeap();
+  if (freeMem < CRITICAL_MEMORY_THRESHOLD) {
+    Serial.println("🚨 CRITICAL MEMORY after camera - Aborting door operation!");
+    endCriticalOperation("Intercom Opening - PARTIAL");
+    return;
+  }
+  
+  delay(500);
   pressDoorButton();
   
-  Serial.println("=== Intercom opening sequence completed ===");
+  endCriticalOperation("Intercom Opening");
 }
 
-// Function to check incoming calls
 void checkIncomingCall() {
   int analogValue = analogRead(callIndicatorPin);
   bool currentCallState = (analogValue < settings.callThreshold);
   
-  // Debug information every 10 seconds
+  // Debug every 2 minutes (reduce spam)
   static unsigned long lastDebugTime = 0;
-  if (millis() - lastDebugTime > 10000) {
-    Serial.print("Call indicator A0 value: ");
-    Serial.print(analogValue);
-    Serial.print(" (threshold: ");
-    Serial.print(settings.callThreshold);
-    Serial.println(")");
+  if (millis() - lastDebugTime > 120000) {
+    Serial.print("A0: "); 
+    Serial.print(analogValue); 
+    Serial.print("/"); 
+    Serial.print(settings.callThreshold); 
+    Serial.print(", Mem: "); 
+    Serial.print(ESP.getFreeHeap()); 
+    Serial.println("b");
     lastDebugTime = millis();
   }
   
-  // New call detection
-  if (currentCallState && !lastCallState) {
-    // New call detected
-    if (millis() - lastCallTime > settings.callDebounceTime) {
+  if (currentCallState && !lastCallState && 
+      (millis() - lastCallTime > settings.callDebounceTime)) {
+    
       callDetected = true;
       lastCallTime = millis();
       
-      // Call notification via Telegram
-      Serial.println("🔔 === INCOMING CALL DETECTED ===");
-      Serial.println("📞 Someone is calling the intercom!");
-      
-      String callMessage = "🔔 INCOMING CALL!\n\nSomeone is calling the intercom.\nPress 'Open' to open.";
-      bool sent = bot.sendMessageWithReplyKeyboard(CHAT_ID, callMessage, "", replyKeyboard, true, false, false);
-      Serial.print("📤 Telegram notification: "); Serial.println(sent ? "✅ Sent" : "❌ Failed");
-      
-      Serial.println("================================");
-    }
+    Serial.println("📞 === INCOMING CALL DETECTED ===");
+    Serial.println("Analog value: " + String(analogValue));
+    
+    // Send notification
+    String callMsg = "📞 INCOMING CALL!\n\nAnalog value: " + String(analogValue);
+    callMsg += "\nThreshold: " + String(settings.callThreshold);
+    callMsg += "\nTime: " + String(millis() / 60000) + " min uptime";
+    
+    bot.sendMessage(CHAT_ID, callMsg, "");
+    Serial.println("📤 Call notification sent");
   }
   
   lastCallState = currentCallState;
 }
 
-// Handle new messages: only /start and one inline button "Open"
+// ========== TELEGRAM MESSAGE HANDLING ==========
+
 void handleNewMessages(int numNewMessages) {
-  Serial.print("📩 handleNewMessages: "); Serial.println(numNewMessages);
+  ESP.wdtFeed();
+  Serial.println("📨 Handling " + String(numNewMessages) + " new messages");
 
   for (int i = 0; i < numNewMessages; i++) {
+    ESP.wdtFeed();
+    
     String chat_id = String(bot.messages[i].chat_id);
     String text = bot.messages[i].text;
     String from_name = bot.messages[i].from_name;
 
-    Serial.println("=== MESSAGE DEBUG ===");
-    Serial.print("Chat ID: "); Serial.println(chat_id);
-    Serial.print("Expected: "); Serial.println(CHAT_ID);
-    Serial.print("Text: "); Serial.println(text);
-    Serial.print("From: "); Serial.println(from_name);
-    Serial.println("====================");
+    Serial.println("📩 Message from " + from_name + " (" + chat_id + "): " + text);
 
     if (chat_id != CHAT_ID) {
-      Serial.println("❌ Unauthorized user - chat ID mismatch!");
-      bot.sendMessage(chat_id, "Your Chat ID: " + chat_id + "\nUpdate secrets.h with this ID", "");
+      bot.sendMessage(chat_id, "❌ Unauthorized access", "");
+      Serial.println("⚠️ Unauthorized user blocked");
       continue;
-    } else {
-      Serial.println("✅ Authorized user - processing message");
     }
 
-    // Normal text messages only; reply keyboard sends text "Open"
     if (text == "/start") {
-      Serial.println("🏠 Processing /start command");
-      String welcome = "🏠 Welcome, " + from_name + "!\n\nThis bot controls the intercom:\n• Monitor incoming calls 🔔\n• Open intercom 🚪\n\nPress 'Open' to open or /status for system status.";
+      String welcome = "🏠 *Telegram Intercom System*\n\n";
+      welcome += "Welcome! Use the button below to open the intercom:\n\n";
+      welcome += "🎥 Camera will activate for " + String(settings.cameraActivationTime) + "ms\n";
+      welcome += "🚪 Door will unlock for " + String(settings.doorActivationTime) + "ms\n";
+      welcome += "📞 Call detection threshold: " + String(settings.callThreshold) + "\n\n";
+      welcome += "📋 *Available Commands:*\n";
+      welcome += "/start - Show this menu\n";
+      welcome += "/status - System status";
+
+      String replyKeyboard = "[[\"🚪 Open Intercom\"], [\"📊 Status\"]]";
       bot.sendMessageWithReplyKeyboard(chat_id, welcome, "", replyKeyboard, true, false, false);
-    } else if (text == "Open") {
-      Serial.println("🚪 Processing 'Open' command - INTERCOM SEQUENCE START");
-      bot.sendMessage(chat_id, "🎥 Activating intercom camera...", "");
       
-      // Включаем камеру (2 секунды)
-      pressCameraButton();
+    } else if (text == "🚪 Open Intercom") {
+      Serial.println("🚪 Remote open command received");
       
-      bot.sendMessage(chat_id, "🚪 Opening door lock...", "");
+      bot.sendMessage(chat_id, "🎥 Activating camera and opening door...", "");
+      openIntercom();
       
-      // Пауза и открытие замка
-      delay(500);
-      pressDoorButton();
+      String confirmMsg = "✅ *Intercom Opened Successfully*\n\n";
+      confirmMsg += "🎥 Camera activated for " + String(settings.cameraActivationTime) + "ms\n";
+      confirmMsg += "🚪 Door unlocked for " + String(settings.doorActivationTime) + "ms\n";
+      confirmMsg += "⏰ Time: " + String(millis() / 60000) + " min uptime";
       
-      bot.sendMessage(chat_id, "✅ Intercom opened!", "");
-      Serial.println("🚪 INTERCOM SEQUENCE COMPLETED");
-    } else if (text == "/status") {
-      Serial.println("📊 Processing /status command");
-      // Команда для проверки состояния системы
-      int analogValue = analogRead(callIndicatorPin);
-      String statusMessage = "🏠 Intercom bot started!\n";
-      statusMessage += "IP: " + WiFi.localIP().toString() + "\n\n";
-      statusMessage += "System ready to work!\n\n";
-      statusMessage += "📊 SYSTEM STATUS\n\n";
-      statusMessage += "🔌 Analog input A0: " + String(analogValue) + "\n";
-      statusMessage += "⚡ Threshold value: " + String(settings.callThreshold) + "\n";
-      statusMessage += "🚨 Call status: " + String(analogValue < settings.callThreshold ? "CALL" : "NORMAL") + "\n";
-      statusMessage += "🎥 Camera time: " + String(settings.cameraActivationTime) + "ms\n";
-      statusMessage += "🚪 Door time: " + String(settings.doorActivationTime) + "ms\n";
-      statusMessage += "⏱️ Call debounce: " + String(settings.callDebounceTime) + "ms\n\n";
-      statusMessage += "📈 SYSTEM INFO\n\n";
-      statusMessage += "💾 Free memory: " + String(ESP.getFreeHeap()) + " bytes\n";
-      statusMessage += "⏰ Current uptime: " + String(millis() / 60000) + " min\n";
-      statusMessage += "📊 Boot count: " + String(settings.rebootCount) + "\n";
-      statusMessage += "🔄 Reset reason: " + ESP.getResetReason() + "\n\n";
-      statusMessage += "🌐 WEB INTERFACE\n\n";
-      statusMessage += "🏠 Main: http://" + WiFi.localIP().toString() + "/\n";
-      statusMessage += "⚙️ Settings: http://" + WiFi.localIP().toString() + "/settings\n";
-      statusMessage += "🔄 OTA Update: http://" + WiFi.localIP().toString() + "/update\n";
-      statusMessage += "🌐 mDNS: http://intercom.local/";
+      bot.sendMessage(chat_id, confirmMsg, "Markdown");
       
-      bot.sendMessage(chat_id, statusMessage, "");
+    } else if (text == "/status" || text == "📊 Status") {
+      Serial.println("📊 Status command received - OPTIMIZED VERSION");
+      
+      // Проверяем память перед созданием большого сообщения
+      uint32_t memBefore = ESP.getFreeHeap();
+      if (memBefore < 20000) {
+        bot.sendMessage(chat_id, "⚠️ Low memory, sending short status:\n💾 Memory: " + String(memBefore) + " bytes\n📊 IP: " + WiFi.localIP().toString(), "");
+        return;
+      }
+      
+      // Создаем статус по частям для экономии памяти
+      String statusMsg = "📊 *System Status*\n\n";
+      
+      // WiFi Status
+      statusMsg += "📡 *WiFi:* ";
+      statusMsg += (WiFi.status() == WL_CONNECTED) ? "✅ Connected\n" : "❌ Disconnected\n";
+      if (WiFi.status() == WL_CONNECTED) {
+        statusMsg += "🌐 *SSID:* ";
+        statusMsg += WiFi.SSID();
+        statusMsg += "\n📍 *IP:* ";
+        statusMsg += WiFi.localIP().toString();
+        statusMsg += "\n";
+      }
+      
+      // Отправляем первую часть и очищаем строку
+      bot.sendMessage(chat_id, statusMsg, "Markdown");
+      statusMsg = ""; // Освобождаем память
+      
+      // Telegram Status  
+      statusMsg = "💬 *Telegram:* ";
+      statusMsg += telegramConnected ? "✅ Connected" : "❌ Disconnected";
+      statusMsg += "\n💾 *Memory:* ";
+      statusMsg += String(ESP.getFreeHeap());
+      statusMsg += " bytes\n⏰ *Uptime:* ";
+      statusMsg += String(millis() / 60000);
+      statusMsg += " min";
+      
+      String replyKeyboard = "[[\"🚪 Open Intercom\"], [\"📊 Status\"]]";
+      bot.sendMessageWithReplyKeyboard(chat_id, statusMsg, "Markdown", replyKeyboard, true, false, false);
+      
     } else {
-      Serial.print("❓ Unknown command received: '"); Serial.print(text); Serial.println("'");
-      bot.sendMessageWithReplyKeyboard(chat_id, "🏠 To open the intercom press 'Open' button\n\nAvailable commands:\n/start - main menu\n/status - system status", "", replyKeyboard, true, false, false);
+      bot.sendMessage(chat_id, "❓ Unknown command. Use /start to see available options.", "");
     }
   }
 }
 
-void setup() {
-  Serial.begin(115200);
+// ========== EEPROM FUNCTIONS ==========
+
+void saveSettings() {
+  EEPROM.put(0, settings);
+  EEPROM.commit();
+  Serial.println("⚙️ Settings saved to EEPROM");
+}
+
+void loadSettings() {
+  EEPROM.get(0, settings);
   
-  // Initialize EEPROM for settings
-  EEPROM.begin(sizeof(IntercomSettings));
-  loadSettings();
-  
-  Serial.println("=== CONFIGURATION DEBUG ===");
-  Serial.print("Secrets loaded from: "); Serial.println(SECRETS_SOURCE);
-  Serial.print("WiFi SSID: "); Serial.println(WIFI_SSID);
-  Serial.print("WiFi Password: "); Serial.println(WIFI_PASSWORD);
-  Serial.print("Bot Token: "); Serial.println(BOT_TOKEN);
-  Serial.print("Chat ID: "); Serial.println(CHAT_ID);
-  
-  Serial.println("=== RESET DIAGNOSIS ===");
-  Serial.print("🔄 Reset reason: "); Serial.println(ESP.getResetReason());
-  Serial.print("💾 Free heap: "); Serial.print(ESP.getFreeHeap()); Serial.println(" bytes");
-  Serial.print("⚡ CPU frequency: "); Serial.print(ESP.getCpuFreqMHz()); Serial.println(" MHz");
-  Serial.print("🔌 VCC: "); Serial.print(ESP.getVcc()); Serial.println(" mV (if ADC_VCC enabled)");
-  
-  // Check if real data was loaded
-  if (String(WIFI_SSID) == "YOUR_WIFI_SSID") {
-    Serial.println("🚨 WARNING: Using template values! Real secrets.h not loaded!");
+  // Validate settings and load defaults if invalid
+  if (settings.cameraActivationTime < 100 || settings.cameraActivationTime > 10000 || 
+      settings.callThreshold < 0 || settings.callThreshold > 1023 ||
+      settings.callDebounceTime < 1000 || settings.callDebounceTime > 60000 ||
+      settings.watchdogTimeout < 1 || settings.watchdogTimeout > 60) {
+    
+    // Load default settings
+    settings.cameraActivationTime = 2000;
+    settings.callThreshold = 200;
+    settings.callDebounceTime = 5000;
+    settings.doorActivationTime = 200;
+    strncpy(settings.botToken, BOT_TOKEN, sizeof(settings.botToken) - 1);
+    strncpy(settings.chatId, CHAT_ID, sizeof(settings.chatId) - 1);
+    settings.rebootCount = 1;
+    settings.lastUptime = 0;
+    settings.watchdogTimeout = 8;
+    
+    Serial.println("⚙️ Loading default settings");
+    saveSettings();
   } else {
-    Serial.println("✅ Real secrets loaded successfully");
+    settings.rebootCount++;
+    settings.lastUptime = millis() / 60000;
+    saveSettings();
+  }
+}
+
+// ========== WEB SERVER ==========
+
+void handleRoot() {
+  String page = "<!DOCTYPE html><html><head>";
+  page += "<title>Telegram Intercom</title>";
+  page += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  page += "<style>";
+  page += "body{font-family:Arial,sans-serif;margin:20px;background:#f5f5f5}";
+  page += ".container{max-width:800px;margin:0 auto;background:white;padding:20px;border-radius:10px;box-shadow:0 2px 10px rgba(0,0,0,0.1)}";
+  page += ".status{background:#e8f5e8;padding:15px;border-radius:5px;margin:10px 0}";
+  page += ".controls{background:#f0f8ff;padding:15px;border-radius:5px;margin:10px 0}";
+  page += "a{color:#0066cc;text-decoration:none;margin-right:15px}";
+  page += "a:hover{text-decoration:underline}";
+  page += "</style>";
+  page += "</head><body>";
+  page += "<div class='container'>";
+  page += "<h1>🏠 Telegram Intercom System</h1>";
+  
+  page += "<div class='status'>";
+  page += "<h2>📊 System Status</h2>";
+  page += "<p><strong>WiFi:</strong> " + String(WiFi.status() == WL_CONNECTED ? "✅ Connected" : "❌ Disconnected") + "</p>";
+  page += "<p><strong>IP Address:</strong> " + WiFi.localIP().toString() + "</p>";
+  page += "<p><strong>Telegram:</strong> " + String(telegramConnected ? "✅ Connected" : "❌ Disconnected") + "</p>";
+  page += "<p><strong>Telegram Port:</strong> " + String(workingTelegramPort) + "</p>";
+  page += "<p><strong>SSL Mode:</strong> 🔓 Insecure (Livebox 6 compatible)</p>";
+  page += "<p><strong>Uptime:</strong> " + String(millis() / 60000) + " minutes</p>";
+  page += "<p><strong>Free Memory:</strong> " + String(ESP.getFreeHeap()) + " bytes</p>";
+  page += "<p><strong>Reboot Count:</strong> " + String(settings.rebootCount) + "</p>";
+  page += "</div>";
+  
+  page += "<div class='controls'>";
+  page += "<h2>🔧 Controls</h2>";
+  page += "<p><a href='/settings'>⚙️ Settings</a>";
+  page += "<a href='/wifi'>📶 WiFi Setup</a>";
+  page += "<a href='/otainfo'><strong>🔄 OTA Update (ElegantOTA)</strong></a>";
+  page += "<a href='/test'>🧪 Test Telegram</a>";
+  page += "<a href='/reboot'>🔄 Reboot System</a></p>";
+  page += "<div style='background:#e8f4f8;padding:10px;border-radius:5px;margin:10px 0'>";
+  page += "<small>📋 <strong>OTA Update:</strong> Upload firmware via web interface<br>";
+  page += "🌐 <strong>Direct link:</strong> <a href='/update' target='_blank'>http://intercom.local/update</a></small>";
+  page += "</div>";
+  page += "</div>";
+  
+  page += "</div></body></html>";
+  
+  server.send(200, "text/html", page);
+}
+
+void handleSettings() {
+  String page = "<!DOCTYPE html><html><head>";
+  page += "<title>Settings - Telegram Intercom</title>";
+  page += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  page += "<style>";
+  page += "body{font-family:Arial,sans-serif;margin:20px;background:#f5f5f5}";
+  page += ".container{max-width:800px;margin:0 auto;background:white;padding:20px;border-radius:10px;box-shadow:0 2px 10px rgba(0,0,0,0.1)}";
+  page += ".setting{margin:15px 0;padding:10px;border:1px solid #ddd;border-radius:5px}";
+  page += "input[type=number]{width:100px;padding:5px}";
+  page += "button{background:#0066cc;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer}";
+  page += "button:hover{background:#0052a3}";
+  page += ".warning{background:#fff3cd;color:#856404;padding:10px;border-radius:5px;margin:10px 0}";
+  page += "</style>";
+  page += "</head><body>";
+  page += "<div class='container'>";
+  page += "<h1>⚙️ System Settings</h1>";
+  page += "<p><a href='/'>← Back to Status</a></p>";
+  
+  page += "<div class='warning'>";
+  page += "⚠️ <strong>Warning:</strong> Changing these settings will restart the system!";
+  page += "</div>";
+  
+  page += "<form method='POST' action='/save'>";
+  
+  page += "<div class='setting'>";
+  page += "<h3>🎥 Camera Settings</h3>";
+  page += "<label>Camera Activation Time (ms): </label>";
+  page += "<input type='number' name='cameraTime' value='" + String(settings.cameraActivationTime) + "' min='100' max='10000'>";
+  page += "<small> (100-10000ms)</small>";
+  page += "</div>";
+  
+  page += "<div class='setting'>";
+  page += "<h3>🚪 Door Settings</h3>";
+  page += "<label>Door Activation Time (ms): </label>";
+  page += "<input type='number' name='doorTime' value='" + String(settings.doorActivationTime) + "' min='50' max='5000'>";
+  page += "<small> (50-5000ms)</small>";
+  page += "</div>";
+  
+  page += "<div class='setting'>";
+  page += "<h3>📞 Call Detection</h3>";
+  page += "<label>Call Threshold (A0 value): </label>";
+  page += "<input type='number' name='threshold' value='" + String(settings.callThreshold) + "' min='0' max='1023'>";
+  page += "<small> (0-1023, current A0: " + String(analogRead(callIndicatorPin)) + ")</small><br><br>";
+  page += "<label>Call Debounce Time (ms): </label>";
+  page += "<input type='number' name='debounce' value='" + String(settings.callDebounceTime) + "' min='1000' max='60000'>";
+  page += "<small> (1000-60000ms)</small>";
+  page += "</div>";
+  
+  page += "<div class='setting'>";
+  page += "<h3>🐕 Watchdog Settings</h3>";
+  page += "<label>Watchdog Timeout (seconds): </label>";
+  page += "<input type='number' name='watchdog' value='" + String(settings.watchdogTimeout) + "' min='1' max='60'>";
+  page += "<small> (1-60 seconds)</small>";
+  page += "</div>";
+  
+  page += "<br><button type='submit'>💾 Save Settings & Reboot</button>";
+  page += "</form>";
+  
+  page += "</div></body></html>";
+  
+  server.send(200, "text/html", page);
+}
+
+void handleSaveSettings() {
+  if (server.hasArg("cameraTime")) {
+    settings.cameraActivationTime = server.arg("cameraTime").toInt();
+  }
+  if (server.hasArg("doorTime")) {
+    settings.doorActivationTime = server.arg("doorTime").toInt();
+  }
+  if (server.hasArg("threshold")) {
+    settings.callThreshold = server.arg("threshold").toInt();
+  }
+  if (server.hasArg("debounce")) {
+    settings.callDebounceTime = server.arg("debounce").toInt();
+  }
+  if (server.hasArg("watchdog")) {
+    settings.watchdogTimeout = server.arg("watchdog").toInt();
   }
   
-  // Important information for debugging
-  Serial.println("💬 SYSTEM INFO:");
-  Serial.print("Chat ID: "); Serial.println(CHAT_ID);
-  Serial.print("Board: "); 
-  #ifdef ESP8266
-    Serial.println("ESP8266");
-  #endif
-  #ifdef ARDUINO_ESP8266_WEMOS_D1MINI
-    Serial.println("Wemos D1 Mini");
-  #elif defined(ARDUINO_ESP8266_NODEMCU)
-    Serial.println("NodeMCU");
-  #else
-    Serial.println("Generic ESP8266");
-  #endif
-  Serial.print("CPU Freq: "); Serial.print(ESP.getCpuFreqMHz()); Serial.println(" MHz");
-  Serial.println("==============================");
-
-  pinMode(ledPin, OUTPUT);
-  digitalWrite(ledPin, ledState);
+  // Validate settings
+  if (settings.cameraActivationTime < 100) settings.cameraActivationTime = 100;
+  if (settings.cameraActivationTime > 10000) settings.cameraActivationTime = 10000;
+  if (settings.doorActivationTime < 50) settings.doorActivationTime = 50;
+  if (settings.doorActivationTime > 5000) settings.doorActivationTime = 5000;
+  if (settings.callThreshold < 0) settings.callThreshold = 0;
+  if (settings.callThreshold > 1023) settings.callThreshold = 1023;
+  if (settings.callDebounceTime < 1000) settings.callDebounceTime = 1000;
+  if (settings.callDebounceTime > 60000) settings.callDebounceTime = 60000;
+  if (settings.watchdogTimeout < 1) settings.watchdogTimeout = 1;
+  if (settings.watchdogTimeout > 60) settings.watchdogTimeout = 60;
   
-  // Initialize pins for intercom control
-  pinMode(cameraPin, OUTPUT);
-  pinMode(doorPin, OUTPUT);
+  saveSettings();
   
-  // Set pins to inactive state (buttons not pressed)
-  digitalWrite(cameraPin, optocouplerActiveHigh ? LOW : HIGH);
-  digitalWrite(doorPin, optocouplerActiveHigh ? LOW : HIGH);
+  String page = "<!DOCTYPE html><html><head>";
+  page += "<meta http-equiv='refresh' content='3;url=/'>";
+  page += "<title>Settings Saved</title>";
+  page += "</head><body>";
+  page += "<h1>✅ Settings Saved!</h1>";
+  page += "<p>System will reboot in 3 seconds...</p>";
+  page += "</body></html>";
   
-  Serial.println("🔌 GPIO PIN MAPPING:");
-  Serial.print("Camera button: GPIO"); Serial.print(cameraPin);
-  Serial.println(" (should be D1 on Wemos/D5 on NodeMCU)");
-  Serial.print("Door button: GPIO"); Serial.print(doorPin); 
-  Serial.println(" (should be D2 on Wemos/D4 on NodeMCU)");
-  Serial.print("Call indicator: A0 (GPIO"); Serial.print(callIndicatorPin); Serial.println(")");
-  Serial.print("Voltage threshold: "); Serial.println(settings.callThreshold);
-  Serial.print("Camera time: "); Serial.print(settings.cameraActivationTime); Serial.println("ms");
-  Serial.print("Door time: "); Serial.print(settings.doorActivationTime); Serial.println("ms");
-  Serial.print("Debounce time: "); Serial.print(settings.callDebounceTime); Serial.println("ms");
-  Serial.println("⚠️  Verify GPIO pins match your hardware wiring!");
-  
-  // Check initial state of call indicator
-  int initialVoltage = analogRead(callIndicatorPin);
-  Serial.print("Initial A0 reading: "); Serial.println(initialVoltage);
-  
-  // GPIO pin test - brief flash for verification
-  Serial.println("🧪 Testing GPIO pins (brief flash)...");
-  digitalWrite(cameraPin, !digitalRead(cameraPin)); delay(100);
-  digitalWrite(cameraPin, !digitalRead(cameraPin));
-  digitalWrite(doorPin, !digitalRead(doorPin)); delay(100); 
-  digitalWrite(doorPin, !digitalRead(doorPin));
-  Serial.println("✅ GPIO pin test completed");
-
-  // WiFiManager setup - automatic connection or web portal
-  Serial.println("=== WiFiManager SETUP ===");
-  WiFiManager wifiManager;
-  
-  // Uncomment to reset WiFi settings (for testing)
-  // wifiManager.resetSettings();
-  
-  // Set custom hostname for the device
-  wifiManager.setHostname("intercom-telegram");
-  
-  // Try to connect to saved WiFi or start captive portal
-  Serial.println("🔗 Starting WiFiManager...");
-  if (!wifiManager.autoConnect("IntercomSetup", "12345678")) {
-    Serial.println("❌ Failed to connect or setup portal timeout");
-    Serial.println("Restarting device...");
-    
-    // Indicate WiFi error with LED (1 blink = WiFi failure)
-    indicateError(1, 5);  // 1 blink, repeat 5 times
+  server.send(200, "text/html", page);
     
     delay(1000);
     ESP.restart();
   }
   
-  Serial.println("✅ WiFi connected successfully!");
-  Serial.print("IP address: "); Serial.println(WiFi.localIP());
-  Serial.print("Gateway: "); Serial.println(WiFi.gatewayIP());
-  Serial.print("Subnet: "); Serial.println(WiFi.subnetMask());
-  Serial.print("DNS: "); Serial.println(WiFi.dnsIP());
-  Serial.print("RSSI: "); Serial.print(WiFi.RSSI()); Serial.println(" dBm");
-
-  // Setup mDNS responder
-  if (MDNS.begin("intercom")) {
-    Serial.println("🌐 mDNS responder started");
-    Serial.println("Access device at: http://intercom.local/");
-    MDNS.addService("http", "tcp", 80);
-  } else {
-    Serial.println("❌ Error setting up mDNS responder");
+void handleTest() {
+  String result = "❌ Failed";
+  if (telegramConnected) {
+    bool sent = bot.sendMessage(CHAT_ID, "🧪 Web test message from " + WiFi.localIP().toString(), "");
+    if (sent) {
+      result = "✅ Success";
+      lastSuccessfulMessage = millis();
+    }
   }
-
-  // TLS setup - more aggressive simplification for ESP8266
-  Serial.println("🔒 Setting up TLS/SSL...");
-  #ifdef ESP8266
-    client.setInsecure(); // simplify TLS for ESP8266
-    client.setTimeout(10000); // 10 seconds timeout
-    Serial.println("✅ Using insecure TLS with 10s timeout");
-  #else
-    client.setCACert(TELEGRAM_CERTIFICATE_ROOT);
-    Serial.println("✅ Using certificate validation for ESP32");
-  #endif
-
-  // Web server and OTA setup
-  Serial.println("=== WEB SERVER & OTA SETUP ===");
   
-  // Main page
-  server.on("/", []() {
-    String page = "<html><head><meta charset='UTF-8'><title>Intercom Control</title></head><body>";
-    page += "<h1>🏠 Telegram Intercom System</h1>";
-    page += "<p>IP: " + WiFi.localIP().toString() + "</p>";
-    page += "<p>Status: " + String(WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected") + "</p>";
-    page += "<p><a href='/settings'>⚙️ Settings</a></p>";
-    page += "<p><a href='/update'>🔄 OTA Update</a></p>";
-    page += "</body></html>";
-    server.send(200, "text/html; charset=UTF-8", page);
-  });
-
-  // Settings page
-  server.on("/settings", HTTP_GET, []() {
-    String page = "<html><head><meta charset='UTF-8'><title>Intercom Settings</title></head><body>";
-    page += "<h2>⚙️ Intercom Configuration</h2>";
-    page += "<form method='POST'>";
-    page += "Camera activation time (ms): <input type='number' name='camera' value='" + String(settings.cameraActivationTime) + "'><br><br>";
-    page += "Call threshold (A0): <input type='number' name='threshold' value='" + String(settings.callThreshold) + "'><br><br>";
-    page += "Call debounce time (ms): <input type='number' name='debounce' value='" + String(settings.callDebounceTime) + "'><br><br>";
-    page += "Door activation time (ms): <input type='number' name='door' value='" + String(settings.doorActivationTime) + "'><br><br>";
-    page += "<input type='submit' value='💾 Save Settings'>";
-    page += "</form>";
-    page += "<p><a href='/'>🔙 Back to Home</a></p>";
-    page += "</body></html>";
-    server.send(200, "text/html; charset=UTF-8", page);
-  });
-
-  // Handle settings POST request
-  server.on("/settings", HTTP_POST, []() {
-    bool changed = false;
-    
-    if (server.hasArg("camera")) {
-      settings.cameraActivationTime = constrain(server.arg("camera").toInt(), 100, 10000);
-      changed = true;
-    }
-    if (server.hasArg("threshold")) {
-      settings.callThreshold = constrain(server.arg("threshold").toInt(), 0, 1023);
-      changed = true;
-    }
-    if (server.hasArg("debounce")) {
-      settings.callDebounceTime = constrain(server.arg("debounce").toInt(), 1000, 60000);
-      changed = true;
-    }
-    if (server.hasArg("door")) {
-      settings.doorActivationTime = constrain(server.arg("door").toInt(), 50, 5000);
-      changed = true;
-    }
-
-    if (changed) {
-      saveSettings();
-      Serial.println("⚙️ Settings updated via web interface");
-    }
-
-    server.sendHeader("Location", "/settings");
-    server.send(303);
-  });
-
-  // 404 handler
-  server.onNotFound([]() {
-    server.send(404, "text/plain", "Page not found!");
-  });
-
-  // Initialize ElegantOTA
-  ElegantOTA.begin(&server);
-  ElegantOTA.onStart(onOTAStart);
-  ElegantOTA.onProgress(onOTAProgress);
-  ElegantOTA.onEnd(onOTAEnd);
-
-  // Start web server
-  server.begin();
-  Serial.println("🌐 HTTP server started at http://" + WiFi.localIP().toString());
-  Serial.println("⚙️ Settings: http://intercom.local/settings");
-  Serial.println("🔄 OTA Update: http://intercom.local/update");
-
-  // Telegram setup
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("=== TELEGRAM SETUP ===");
-    Serial.print("💾 Free heap: "); Serial.print(ESP.getFreeHeap()); Serial.println(" bytes");
-    
-    // Send startup notification with reset reason
-    String resetReason = ESP.getResetReason();
-    String startupMsg = "🏠 Intercom bot started!\n";
-    startupMsg += "IP: " + WiFi.localIP().toString() + "\n\n";
-    startupMsg += "📊 BOOT INFO:\n";
-    startupMsg += "🔄 Reset reason: " + resetReason + "\n";
-    startupMsg += "💾 Free memory: " + String(ESP.getFreeHeap()) + " bytes\n";
-    startupMsg += "⚡ CPU freq: " + String(ESP.getCpuFreqMHz()) + " MHz\n";
-    startupMsg += "📊 Boot count: " + String(settings.rebootCount) + "\n";
-    if (settings.lastUptime > 0) {
-      startupMsg += "⏱️ Last uptime: " + String(settings.lastUptime) + " min\n";
-    }
-    startupMsg += "\nSystem ready to work!";
-    
-    bool sent = bot.sendMessageWithReplyKeyboard(CHAT_ID, startupMsg, "", replyKeyboard, true, false, false);
-    Serial.print("📤 Startup notification: "); Serial.println(sent ? "✅ Sent" : "❌ Failed");
-    
-    Serial.println("🤖 Telegram bot ready!");
-    Serial.println("============================");
-  } else {
-    Serial.println("Skipping Telegram setup - No WiFi connection");
-  }
+  String page = "<!DOCTYPE html><html><head>";
+  page += "<meta http-equiv='refresh' content='3;url=/'>";
+  page += "<title>Telegram Test</title>";
+  page += "</head><body>";
+  page += "<h1>📤 Telegram Test: " + result + "</h1>";
+  page += "<p>Returning to main page...</p>";
+  page += "</body></html>";
+  
+  server.send(200, "text/html", page);
 }
 
-void loop() {
-  // Handle web server and OTA
-  server.handleClient();
-  MDNS.update();
-  ElegantOTA.loop();
+void handleWiFi() {
+  String page = "<!DOCTYPE html><html><head>";
+  page += "<title>WiFi Setup - Telegram Intercom</title>";
+  page += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  page += "<style>";
+  page += "body{font-family:Arial,sans-serif;margin:20px;background:#f5f5f5}";
+  page += ".container{max-width:800px;margin:0 auto;background:white;padding:20px;border-radius:10px;box-shadow:0 2px 10px rgba(0,0,0,0.1)}";
+  page += ".wifi-info{background:#e8f4f8;padding:15px;border-radius:5px;margin:10px 0}";
+  page += ".wifi-controls{background:#fff3cd;padding:15px;border-radius:5px;margin:10px 0}";
+  page += "button{background:#0066cc;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer;margin:5px}";
+  page += "button:hover{background:#0052a3}";
+  page += ".danger{background:#dc3545}";
+  page += ".danger:hover{background:#c82333}";
+  page += ".warning{background:#ffc107;color:#000}";
+  page += ".warning:hover{background:#e0a800}";
+  page += "</style>";
+  page += "</head><body>";
+  page += "<div class='container'>";
+  page += "<h1>📶 WiFi Setup</h1>";
+  page += "<p><a href='/'>← Back to Status</a></p>";
   
-  // Check memory every 30 seconds
-  static unsigned long lastMemCheck = 0;
-  if (millis() - lastMemCheck > 30000) {
-    Serial.print("💾 Free: "); Serial.print(ESP.getFreeHeap()); Serial.println(" bytes");
-    lastMemCheck = millis();
+  page += "<div class='wifi-info'>";
+  page += "<h2>📊 Current WiFi Status</h2>";
+  page += "<p><strong>Status:</strong> " + String(WiFi.status() == WL_CONNECTED ? "✅ Connected" : "❌ Disconnected") + "</p>";
+  if (WiFi.status() == WL_CONNECTED) {
+    page += "<p><strong>SSID:</strong> " + WiFi.SSID() + "</p>";
+    page += "<p><strong>IP Address:</strong> " + WiFi.localIP().toString() + "</p>";
+    page += "<p><strong>Gateway:</strong> " + WiFi.gatewayIP().toString() + "</p>";
+    page += "<p><strong>DNS:</strong> " + WiFi.dnsIP().toString() + "</p>";
+    page += "<p><strong>Signal Strength:</strong> " + String(WiFi.RSSI()) + " dBm</p>";
+    page += "<p><strong>MAC Address:</strong> " + WiFi.macAddress() + "</p>";
+  }
+  page += "</div>";
+  
+  page += "<div class='wifi-controls'>";
+  page += "<h2>🔧 WiFi Controls</h2>";
+  page += "<p><strong>WiFi AutoConnect:</strong> Enabled ✅</p>";
+  page += "<p>System automatically connects to saved WiFi networks on startup.</p>";
+  page += "<br>";
+  
+  page += "<button onclick=\"location.href='/wifi/scan'\">🔍 Scan Networks</button>";
+  page += "<button onclick=\"location.href='/wifi/portal'\" class='warning'>⚙️ WiFi Config Portal</button>";
+  page += "<button onclick=\"if(confirm('Reset WiFi settings? Device will restart in AP mode.')) location.href='/wifi/reset'\" class='danger'>🗑️ Reset WiFi</button>";
+  page += "</div>";
+  
+  page += "<div style='background:#f8f9fa;padding:15px;border-radius:5px;margin:10px 0'>";
+  page += "<h3>📋 WiFi Commands</h3>";
+  page += "<ul>";
+  page += "<li><strong>Scan Networks:</strong> Show available WiFi networks</li>";
+  page += "<li><strong>Config Portal:</strong> Open WiFiManager portal (device will restart)</li>";
+  page += "<li><strong>Reset WiFi:</strong> Clear saved credentials and restart in AP mode</li>";
+  page += "</ul>";
+  page += "</div>";
+  
+  page += "</div></body></html>";
+  
+  server.send(200, "text/html", page);
+}
+
+void handleWiFiScan() {
+  String page = "<!DOCTYPE html><html><head>";
+  page += "<title>WiFi Scan - Telegram Intercom</title>";
+  page += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  page += "<meta http-equiv='refresh' content='30'>";  // Auto refresh every 30 seconds
+  page += "<style>";
+  page += "body{font-family:Arial,sans-serif;margin:20px;background:#f5f5f5}";
+  page += ".container{max-width:800px;margin:0 auto;background:white;padding:20px;border-radius:10px;box-shadow:0 2px 10px rgba(0,0,0,0.1)}";
+  page += ".network{background:#f8f9fa;padding:10px;margin:5px 0;border-radius:5px;border-left:4px solid #0066cc}";
+  page += ".strong{color:#28a745}";
+  page += ".medium{color:#ffc107}";
+  page += ".weak{color:#dc3545}";
+  page += "</style>";
+  page += "</head><body>";
+  page += "<div class='container'>";
+  page += "<h1>🔍 WiFi Network Scan</h1>";
+  page += "<p><a href='/wifi'>← Back to WiFi Setup</a></p>";
+  
+  page += "<p>🔄 Scanning for networks... (auto-refresh every 30s)</p>";
+  
+  // Perform WiFi scan
+  int networkCount = WiFi.scanNetworks();
+  
+  if (networkCount == 0) {
+    page += "<p>❌ No networks found</p>";
+  } else {
+    page += "<p>📡 Found " + String(networkCount) + " networks:</p>";
+    
+    for (int i = 0; i < networkCount; i++) {
+      String ssid = WiFi.SSID(i);
+      int rssi = WiFi.RSSI(i);
+      String security = (WiFi.encryptionType(i) == ENC_TYPE_NONE) ? "🔓 Open" : "🔒 Secured";
+      
+      String signalClass = "weak";
+      String signalText = "Weak";
+      if (rssi > -50) {
+        signalClass = "strong";
+        signalText = "Strong";
+      } else if (rssi > -70) {
+        signalClass = "medium";
+        signalText = "Medium";
+      }
+      
+      page += "<div class='network'>";
+      page += "<strong>" + ssid + "</strong> " + security;
+      page += "<br><span class='" + signalClass + "'>📶 " + signalText + " (" + String(rssi) + " dBm)</span>";
+      page += "</div>";
+    }
   }
   
-  // Check incoming calls
+  page += "</div></body></html>";
+  
+  server.send(200, "text/html", page);
+}
+
+void handleWiFiPortal() {
+  String page = "<!DOCTYPE html><html><head>";
+  page += "<meta http-equiv='refresh' content='5;url=http://192.168.4.1'>";
+  page += "<title>WiFi Portal Starting</title>";
+  page += "</head><body>";
+  page += "<h1>📶 Starting WiFi Configuration Portal...</h1>";
+  page += "<p>Device will restart and create 'TelegramIntercom' network.</p>";
+  page += "<p>Connect to 'TelegramIntercom' and go to 192.168.4.1</p>";
+  page += "<p>Redirecting in 5 seconds...</p>";
+  page += "</body></html>";
+  
+  server.send(200, "text/html", page);
+  
+  delay(2000);
+  WiFiManager wm;
+  wm.resetSettings();  // Clear saved WiFi
+  ESP.restart();       // Restart to enter portal mode
+}
+
+void handleWiFiReset() {
+  String page = "<!DOCTYPE html><html><head>";
+  page += "<meta http-equiv='refresh' content='5;url=http://192.168.4.1'>";
+  page += "<title>WiFi Reset</title>";
+  page += "</head><body>";
+  page += "<h1>🗑️ WiFi Settings Reset</h1>";
+  page += "<p>All WiFi credentials cleared!</p>";
+  page += "<p>Device will restart in AP mode as 'TelegramIntercom'</p>";
+  page += "<p>Connect to 'TelegramIntercom' network and go to 192.168.4.1</p>";
+  page += "<p>Redirecting in 5 seconds...</p>";
+    page += "</body></html>";
+  
+  server.send(200, "text/html", page);
+  
+  delay(2000);
+  WiFiManager wm;
+  wm.resetSettings();  // Clear all saved WiFi credentials
+  ESP.restart();       // Restart to enter AP mode
+}
+
+void handleOTAInfo() {
+  String page = "<!DOCTYPE html><html><head>";
+  page += "<title>OTA Update Info - Telegram Intercom</title>";
+  page += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  page += "<style>";
+  page += "body{font-family:Arial,sans-serif;margin:20px;background:#f5f5f5}";
+  page += ".container{max-width:800px;margin:0 auto;background:white;padding:20px;border-radius:10px;box-shadow:0 2px 10px rgba(0,0,0,0.1)}";
+  page += ".ota-info{background:#e8f4f8;padding:15px;border-radius:5px;margin:10px 0}";
+  page += ".warning{background:#fff3cd;color:#856404;padding:15px;border-radius:5px;margin:10px 0}";
+  page += "button{background:#0066cc;color:white;padding:15px 30px;border:none;border-radius:5px;cursor:pointer;font-size:16px}";
+  page += "button:hover{background:#0052a3}";
+  page += ".step{background:#f8f9fa;padding:10px;margin:5px 0;border-left:4px solid #0066cc;border-radius:3px}";
+  page += "</style>";
+  page += "</head><body>";
+  page += "<div class='container'>";
+  page += "<h1>🔄 OTA (Over-The-Air) Update</h1>";
+  page += "<p><a href='/'>← Back to Status</a></p>";
+  
+  page += "<div class='ota-info'>";
+  page += "<h2>📊 Current System Info</h2>";
+  page += "<p><strong>Chip ID:</strong> " + String(ESP.getChipId(), HEX) + "</p>";
+  page += "<p><strong>Flash Size:</strong> " + String(ESP.getFlashChipSize()) + " bytes</p>";
+  page += "<p><strong>Free Space:</strong> " + String(ESP.getFreeSketchSpace()) + " bytes</p>";
+  page += "<p><strong>Sketch Size:</strong> " + String(ESP.getSketchSize()) + " bytes</p>";
+  page += "<p><strong>Core Version:</strong> " + String(ESP.getCoreVersion()) + "</p>";
+  page += "<p><strong>SDK Version:</strong> " + String(ESP.getSdkVersion()) + "</p>";
+  page += "</div>";
+  
+  page += "<div class='warning'>";
+  page += "⚠️ <strong>Warning:</strong> Do not power off the device during OTA update!<br>";
+  page += "📶 Ensure stable WiFi connection before starting update.";
+  page += "</div>";
+  
+  page += "<h2>📋 How to Update</h2>";
+  page += "<div class='step'>1. Compile your code in Arduino IDE</div>";
+  page += "<div class='step'>2. Go to Sketch → Export compiled Binary</div>";
+  page += "<div class='step'>3. Click 'Go to ElegantOTA' button below</div>";
+  page += "<div class='step'>4. Upload the .bin file</div>";
+  page += "<div class='step'>5. Wait for completion and device restart</div>";
+  
+  page += "<br>";
+  page += "<button onclick=\"window.open('/update', '_blank')\">🚀 Go to ElegantOTA Update Page</button>";
+  
+  page += "<h3>🔗 Direct Links</h3>";
+  page += "<ul>";
+  page += "<li><a href='/update' target='_blank'>ElegantOTA Update Interface</a></li>";
+  page += "<li><a href='http://" + WiFi.localIP().toString() + "/update' target='_blank'>Direct IP Access</a></li>";
+  page += "</ul>";
+  
+  page += "</div></body></html>";
+  
+  server.send(200, "text/html", page);
+}
+
+void handleReboot() {
+  String page = "<!DOCTYPE html><html><head>";
+  page += "<meta http-equiv='refresh' content='5;url=/'>";
+  page += "<title>System Reboot</title>";
+  page += "</head><body>";
+  page += "<h1>🔄 System Rebooting...</h1>";
+  page += "<p>Please wait 30 seconds and refresh the page.</p>";
+  page += "</body></html>";
+  
+  server.send(200, "text/html", page);
+  
+  delay(1000);
+  ESP.restart();
+}
+
+// ========== SETUP ==========
+
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+  
+  Serial.println("");
+  Serial.println("");
+  Serial.println(FPSTR(PROGMEM_SYSTEM_STARTUP));
+  Serial.println("⏰ Timestamp: " + String(millis()));
+  Serial.println("🔄 Reset reason: " + ESP.getResetReason());
+  Serial.println("💾 Free heap: " + String(ESP.getFreeHeap()) + " bytes");
+  
+  // Initialize EEPROM
+  Serial.println("📝 Initializing EEPROM...");
+  EEPROM.begin(sizeof(IntercomSettings));
+  loadSettings();
+  Serial.println("✅ Settings loaded");
+  
+  // Hardware watchdog
+  Serial.println("🐕 Enabling hardware watchdog...");
+  ESP.wdtDisable();
+  ESP.wdtEnable(settings.watchdogTimeout * 1000);
+  ESP.wdtFeed();
+  Serial.println("✅ Hardware watchdog enabled");
+  
+  // Initialize advanced watchdog system
+  lastLoopTime = millis();
+  lastTelegramActivity = millis();
+  lastWiFiCheck = millis();
+  softwareWatchdogCounter = 0;
+  minFreeHeap = ESP.getFreeHeap();
+  Serial.println("🐕 Advanced watchdog system initialized");
+  
+  // Pin setup
+  pinMode(cameraButtonPin, OUTPUT);
+  pinMode(doorButtonPin, OUTPUT);
+  pinMode(ledPin, OUTPUT);
+  
+  digitalWrite(cameraButtonPin, optocouplerActiveHigh ? LOW : HIGH);
+  digitalWrite(doorButtonPin, optocouplerActiveHigh ? LOW : HIGH);
+  digitalWrite(ledPin, HIGH);
+  
+  Serial.println("✅ Hardware pins configured");
+  
+  // WiFi setup
+  Serial.println("📶 Setting up WiFi...");
+  WiFiManager wm;
+  
+  // Set timeouts for WiFiManager (compatible with different library versions)
+  wm.setTimeout(300);  // Timeout for connection attempts
+  
+  if (!wm.autoConnect("TelegramIntercom")) {
+    Serial.println("❌ Failed to connect WiFi");
+    ESP.restart();
+  }
+  
+  Serial.println("✅ WiFi connected");
+  Serial.println("🌐 Connected to network: " + WiFi.SSID());
+  Serial.println("📡 IP address: " + WiFi.localIP().toString());
+  Serial.println("📶 Signal strength: " + String(WiFi.RSSI()) + " dBm");
+  Serial.println("🔧 Gateway: " + WiFi.gatewayIP().toString());
+  Serial.println("📋 MAC address: " + WiFi.macAddress());
+  
+  // NTP setup
+  Serial.println("🕐 Setting up time synchronization...");
+  if (initializeNTP()) {
+    Serial.println("✅ Time synchronized");
+  } else {
+    Serial.println("⚠️ Time sync failed - SSL may have issues");
+  }
+  
+  // mDNS setup
+  if (MDNS.begin("intercom")) {
+    Serial.println("🌐 mDNS started: http://intercom.local/");
+  }
+  
+  // Auto-detect working Telegram port
+  if (!autoPortTestCompleted) {
+    autoDetectTelegramPort();
+    autoPortTestCompleted = true;
+  }
+  
+  // Simple SSL setup with minimal Livebox 6 compatibility
+  Serial.println("🔒 Setting up SSL for Telegram with Livebox 6 compatibility...");
+  client.setInsecure();  // Required for Livebox 6 router - bypass certificate validation
+  
+  // Web server routes
+  server.on("/", handleRoot);
+  server.on("/settings", handleSettings);
+  server.on("/save", HTTP_POST, handleSaveSettings);
+  server.on("/test", handleTest);
+  server.on("/reboot", handleReboot);
+  
+  // WiFi management routes
+  server.on("/wifi", handleWiFi);
+  server.on("/wifi/scan", handleWiFiScan);
+  server.on("/wifi/portal", handleWiFiPortal);
+  server.on("/wifi/reset", handleWiFiReset);
+  
+  // OTA info page
+  server.on("/otainfo", handleOTAInfo);
+  
+  // Initialize ElegantOTA (provides /update endpoint)
+  ElegantOTA.begin(&server);
+  server.begin();
+  Serial.println("🌐 Web server started with all routes:");
+  Serial.println("  📊 http://intercom.local/ - Main status");
+  Serial.println("  ⚙️ http://intercom.local/settings - Settings");
+  Serial.println("  📶 http://intercom.local/wifi - WiFi setup");
+  Serial.println("  🔄 http://intercom.local/update - ElegantOTA (Firmware Update)");
+  Serial.println("  📋 http://intercom.local/otainfo - OTA Information");
+  Serial.println("✅ ElegantOTA initialized and ready for firmware updates");
+
+  // Test Telegram
+  Serial.println("=== TELEGRAM SETUP ===");
+  if (testTelegramConnectivity()) {
+    telegramConnected = true;
+    
+    // Send simpler startup message to save memory
+    String startupMsg = "🚀 Intercom Started\n";
+    startupMsg += "IP: " + WiFi.localIP().toString() + "\n";
+    startupMsg += "Boot #" + String(settings.rebootCount) + " Ready!";
+    
+    String replyKeyboard = "[[\"🚪 Open Intercom\"]]";
+    bool sent = bot.sendMessageWithReplyKeyboard(CHAT_ID, startupMsg, "", replyKeyboard, true, false, false);
+    Serial.println("📤 Startup notification: " + String(sent ? "✅ Sent" : "❌ Failed"));
+    
+    if (sent) {
+      lastSuccessfulMessage = millis();
+      Serial.println("✅ Telegram fully operational");
+    }
+  } else {
+    Serial.println("❌ Telegram connectivity failed");
+  }
+  
+  Serial.println("🔥 SETUP COMPLETED - ENTERING MAIN LOOP");
+  Serial.println("========================================");
+  Serial.println("💡 Serial commands available! Type 'help' for list");
+}
+
+// ========== MAIN LOOP ==========
+
+void loop() {
+  // Advanced watchdog feeding
+  softwareWatchdogFeed();
+  
+  // Continuous memory monitoring and emergency cleanup
+  uint32_t currentLoopMemory = ESP.getFreeHeap();
+  if (currentLoopMemory < 12000) {
+    Serial.println("🚨 LOOP: Critical memory detected: " + String(currentLoopMemory) + " bytes");
+    forceMemoryCleanup();
+    
+    // Double check after cleanup
+    currentLoopMemory = ESP.getFreeHeap();
+    if (currentLoopMemory < 10000) {
+      Serial.println("🚨 LOOP: Emergency restart - cleanup failed!");
+      emergencyRestart("Loop memory critically low");
+    }
+  }
+  
+  // Debug: показать что loop работает (каждые 30 секунд)
+  static unsigned long lastLoopDebug = 0;
+  if (millis() - lastLoopDebug > 30000) {
+    Serial.println("🔄 Loop running, memory: " + String(ESP.getFreeHeap()) + " bytes");
+    Serial.println("💡 Serial commands ready! Type 'ping' to test");
+    lastLoopDebug = millis();
+  }
+  
+  // System health monitoring
+  checkSystemHealth();
+  checkMemoryHealth();
+  
+  // Handle web server (with emergency mode)
+  uint32_t freeBeforeWeb = ESP.getFreeHeap();
+  if (freeBeforeWeb > 20000) {
+    // Full web server + OTA
+    server.handleClient();
+    ElegantOTA.loop();
+  } else if (freeBeforeWeb > 15000) {
+    // Web server only, no OTA
+    server.handleClient();
+  } else if (freeBeforeWeb > 10000) {
+    // EMERGENCY MODE: Handle only critical requests
+    server.handleClient();
+    static unsigned long lastCleanup = 0;
+    if (millis() - lastCleanup > 30000) {
+      forceMemoryCleanup();
+      lastCleanup = millis();
+    }
+  } else {
+    // Memory critically low - skip web server completely
+    static unsigned long lastWebWarning = 0;
+    if (millis() - lastWebWarning > 60000) {
+      Serial.print("🚨 Web disabled, mem: "); 
+      Serial.print(freeBeforeWeb); 
+      Serial.println("b");
+      lastWebWarning = millis();
+    }
+    forceMemoryCleanup();
+  }
+  
+  // Check for incoming calls
   checkIncomingCall();
   
   // Handle Telegram messages
   if (millis() > lastTimeBotRan + botRequestDelay) {
-    int numNewMessages = bot.getUpdates(bot.last_message_received + 1);
-    
-    while (numNewMessages) {
-      Serial.println("🔄 Processing Telegram messages...");
-      handleNewMessages(numNewMessages);
-      numNewMessages = bot.getUpdates(bot.last_message_received + 1);
+    // Check memory before Telegram operations
+    uint32_t freeMem = ESP.getFreeHeap();
+    if (freeMem < 15000) {
+      Serial.println("🚨 Skipping Telegram check - low memory: " + String(freeMem) + " bytes");
+      forceMemoryCleanup();
+      lastTimeBotRan = millis();
+      
+      // Emergency restart if memory critically low
+      if (freeMem < 10000) {
+        Serial.println("🚨 CRITICAL: Memory too low for any operation!");
+        emergencyRestart("Memory critically low before Telegram");
+      }
+      return;
     }
+    
+    beginCriticalOperation("Telegram Message Handling");
+    
+    // Reconnect if needed
+    if (!telegramConnected && (millis() - lastTelegramCheck > 30000)) {
+      if (reconnectTelegram()) {
+        telegramConnected = true;
+      }
+      lastTelegramCheck = millis();
+    }
+    
+    // Handle messages
+    if (telegramConnected || WiFi.status() == WL_CONNECTED) {
+      int numNewMessages = bot.getUpdates(bot.last_message_received + 1);
+      if (numNewMessages > 0) {
+        handleNewMessages(numNewMessages);
+        telegramConnected = true;
+        lastSuccessfulMessage = millis();
+        
+        while ((numNewMessages = bot.getUpdates(bot.last_message_received + 1)) > 0) {
+      handleNewMessages(numNewMessages);
+          lastSuccessfulMessage = millis();
+        }
+      } else if (numNewMessages < 0) {
+        Serial.println("❌ Telegram getUpdates failed");
+        telegramConnected = false;
+      }
+    }
+    
     lastTimeBotRan = millis();
+    lastTelegramActivity = millis(); // Update activity timestamp
+    endCriticalOperation("Telegram Message Handling");
   }
   
-  // Serial commands for debugging
+  // Basic Serial commands
   if (Serial.available()) {
+    Serial.println("📡 Serial data available!");
     String command = Serial.readString();
+    Serial.println("📥 Raw command: '" + command + "'");
     command.trim();
+    Serial.println("🎯 Trimmed command: '" + command + "' (length: " + String(command.length()) + ")");
     
     if (command == "open") {
       Serial.println("🚪 Manual open via Serial");
-      // Emulate Telegram message
-      Serial.println("🎥 Activating intercom camera...");
-      pressCameraButton();
-      Serial.println("🚪 Opening door lock...");
-      delay(500);
-      pressDoorButton();
+      openIntercom();
       Serial.println("✅ Intercom opened!");
     } else if (command == "test") {
-      bot.sendMessage(CHAT_ID, "Test message from Serial", "");
+      Serial.println("📤 Sending test message...");
+      bool sent = bot.sendMessage(CHAT_ID, "🧪 Test message from Serial", "");
+      Serial.println("📤 Test: " + String(sent ? "✅ Sent" : "❌ Failed"));
+      if (sent) {
+        telegramConnected = true;
+        lastSuccessfulMessage = millis();
+      }
     } else if (command == "status") {
-      Serial.print("💾 Memory: "); Serial.print(ESP.getFreeHeap()); Serial.println(" bytes");
-      Serial.print("🌐 WiFi: "); Serial.println(WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected");
-      Serial.print("📊 A0: "); Serial.print(analogRead(callIndicatorPin));
-      Serial.println(analogRead(callIndicatorPin) < settings.callThreshold ? " (CALL)" : " (NORMAL)");
-      Serial.print("🌐 IP: "); Serial.println(WiFi.localIP());
-    }
-  }
-  
-  // Force memory cleanup every 5 seconds
-  static unsigned long lastCleanup = 0;
-  if (millis() - lastCleanup > 5000) {
-    yield();
-    lastCleanup = millis();
-    
-    // Emergency restart if critically low memory
-    if (ESP.getFreeHeap() < 5000) {
-      Serial.println("🚨 CRITICAL LOW MEMORY - RESTARTING...");
-      
-      // Save current uptime before restart
-      settings.lastUptime = millis() / 60000;  // Convert to minutes
-      saveSettings();
-      
-      // Try to send Telegram alert if WiFi is connected
+      Serial.println("📊 === SYSTEM STATUS ===");
+      Serial.println("🌐 WiFi: " + String(WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected"));
       if (WiFi.status() == WL_CONNECTED) {
-        String alertMsg = "🚨 CRITICAL ALERT!\n\n";
-        alertMsg += "⚠️ Memory critically low: " + String(ESP.getFreeHeap()) + " bytes\n";
-        alertMsg += "⏱️ Uptime: " + String(millis() / 60000) + " min\n";
-        alertMsg += "🔄 System restarting automatically...\n";
-        alertMsg += "📍 IP: " + WiFi.localIP().toString();
-        
-        bool sent = bot.sendMessage(CHAT_ID, alertMsg, "");
-        Serial.print("📤 Critical alert sent: "); Serial.println(sent ? "✅ Success" : "❌ Failed");
-        delay(1000);
+        Serial.println("📍 IP: " + WiFi.localIP().toString());
+        Serial.println("🌐 SSID: " + WiFi.SSID());
+        Serial.println("📶 Signal: " + String(WiFi.RSSI()) + " dBm");
+      }
+      Serial.println("💬 Telegram: " + String(telegramConnected ? "✅ Connected" : "❌ Disconnected"));
+      Serial.println("🔗 Port: " + String(workingTelegramPort));
+      Serial.println("🔓 SSL: Insecure (Livebox 6 compatible)");
+      Serial.println("💾 Memory: " + String(ESP.getFreeHeap()) + " bytes");
+      Serial.println("⏰ Uptime: " + String(millis() / 60000) + " min");
+      Serial.println("🔄 Boot count: " + String(settings.rebootCount));
+      Serial.println("📞 Call threshold: " + String(settings.callThreshold));
+      Serial.println("📊 Current A0: " + String(analogRead(callIndicatorPin)));
+      Serial.println("🕐 Time sync: " + String(timeInitialized ? "✅ Synced" : "❌ Not synced"));
+      Serial.println("🐕 Watchdog feeds: " + String(softwareWatchdogCounter));
+      Serial.println("💾 Minimum heap: " + String(minFreeHeap) + " bytes");
+      Serial.println("🔒 Critical operation: " + String(criticalOperationInProgress ? "IN PROGRESS" : "None"));
+    } else if (command == "restart") {
+      Serial.println("🔄 Manual restart via Serial...");
+      emergencyRestart("Manual restart via serial");
+    } else if (command == "cleanup") {
+      Serial.println("🧹 Manual memory cleanup...");
+      forceMemoryCleanup();
+      uint32_t afterCleanup = ESP.getFreeHeap();
+      Serial.println("💾 Memory after cleanup: " + String(afterCleanup) + " bytes");
+    } else if (command == "resetwifi") {
+      Serial.println("🗑️ Resetting WiFi settings...");
+      WiFiManager wm;
+      wm.resetSettings();
+      Serial.println("✅ WiFi settings cleared, restarting...");
+      delay(1000);
+      ESP.restart();
+    } else if (command == "wifiportal") {
+      Serial.println("📶 Starting WiFi configuration portal...");
+      WiFi.disconnect(true);
+      delay(1000);
+      WiFiManager wm;
+      wm.resetSettings();
+      wm.setConfigPortalTimeout(300); // 5 minute timeout
+      Serial.println("🔄 Creating 'TelegramIntercom' network...");
+      Serial.println("📱 Connect to 'TelegramIntercom' and go to 192.168.4.1");
+      wm.startConfigPortal("TelegramIntercom");
+    } else if (command == "forcereset") {
+      Serial.println("🔥 FORCE RESET - Clearing ALL WiFi data...");
+      WiFi.disconnect(true);
+      WiFi.mode(WIFI_OFF);
+      delay(1000);
+      ESP.eraseConfig();
+      delay(1000);
+      Serial.println("💥 All settings erased, restarting...");
+      ESP.restart();
+    } else if (command == "scanwifi") {
+      Serial.println("🔍 Scanning for WiFi networks...");
+      int n = WiFi.scanNetworks();
+      if (n == 0) {
+        Serial.println("❌ No networks found");
+      } else {
+        Serial.println("📡 Found " + String(n) + " networks:");
+        for (int i = 0; i < n; ++i) {
+          // Разбиваем сложную конкатенацию WiFi info
+          Serial.print(i + 1); 
+          Serial.print(": "); 
+          Serial.print(WiFi.SSID(i)); 
+          Serial.print(" ("); 
+          Serial.print(WiFi.RSSI(i)); 
+          Serial.print(" dBm) "); 
+          Serial.println((WiFi.encryptionType(i) == ENC_TYPE_NONE) ? "🔓" : "🔒");
+        }
+      }
+    } else if (command == "ping") {
+      Serial.println("🏓 PONG! Serial commands working!");
+      Serial.println("📊 Memory: " + String(ESP.getFreeHeap()) + " bytes");
+      Serial.println("⏰ Uptime: " + String(millis() / 1000) + " seconds");
+    } else if (command == "memtest") {
+      Serial.println("🧪 === MEMORY TEST RESULTS ===");
+      uint32_t freeMem = ESP.getFreeHeap();
+      uint16_t fragmentation = ESP.getHeapFragmentation();
+      uint32_t maxBlock = ESP.getMaxFreeBlockSize();
+      
+      Serial.print("📊 Free: "); Serial.print(freeMem); Serial.println("b");
+      Serial.print("🧩 Frag: "); Serial.print(fragmentation); Serial.println("%");
+      Serial.print("📦 Block: "); Serial.print(maxBlock); Serial.println("b");
+      Serial.print("🏆 Min: "); Serial.print(minFreeHeap); Serial.println("b");
+      
+      // Тест на стабильность памяти
+      if (freeMem > 25000) {
+        Serial.println("🎯 ✅ EXCELLENT");
+      } else if (freeMem > 20000) {
+        Serial.println("🎯 ✅ GOOD");
+      } else if (freeMem > 15000) {
+        Serial.println("🎯 ⚠️ LOW");
+      } else if (freeMem > 10000) {
+        Serial.println("🎯 🚨 CRITICAL");
+      } else {
+        Serial.println("🎯 💀 EMERGENCY");
+      }
+      Serial.println("===============================");
+    } else if (command == "freemem") {
+      Serial.println("🧹 EMERGENCY MEMORY RECOVERY");
+      
+      // Агрессивная очистка
+      for (int i = 0; i < 50; i++) {
+        yield();
+        ESP.wdtFeed();
+        delay(5);
       }
       
-      // Always indicate error with LED (2 blinks = low memory)
-      indicateError(2, 3);  // 2 blinks, repeat 3 times
+      Serial.print("💾 Before: "); Serial.print(ESP.getFreeHeap()); Serial.println("b");
       
-      ESP.restart();
+      // Принудительная сборка мусора
+      delay(500);
+      
+      uint32_t afterMem = ESP.getFreeHeap();
+      Serial.print("💾 After: "); Serial.print(afterMem); Serial.println("b");
+      
+      if (afterMem > 20000) {
+        Serial.println("✅ Memory recovered successfully");
+      } else {
+        Serial.println("⚠️ Memory still low - consider restart");
+      }
+    } else if (command == "help" || command == "?" || command == "") {
+      Serial.println(FPSTR(PROGMEM_HELP_MSG));
+    } else {
+      Serial.println("❓ Unknown command: '" + command + "'");
+      Serial.println("💡 Type 'help' to see available commands");
     }
   }
   
-  // Watchdog protection - restart if system stuck for long time
-  static unsigned long lastActivity = millis();
-  
-  // Update activity time regularly (every time we process something)
-  if (millis() - lastTimeBotRan < botRequestDelay + 1000) {
-    lastActivity = millis();  // System is active if Telegram processing is working
-  }
-  
-  if (millis() - lastActivity > 300000) { // 5 minutes without activity
-    Serial.println("🚨 SYSTEM STUCK - RESTARTING...");
-    
-    // Save current uptime before restart
-    settings.lastUptime = millis() / 60000;  // Convert to minutes
-    saveSettings();
-    
-    // Try to send Telegram alert if WiFi is connected
-    if (WiFi.status() == WL_CONNECTED) {
-      String stuckMsg = "🚨 CRITICAL ALERT!\n\n";
-      stuckMsg += "⏰ System stuck detected!\n";
-      stuckMsg += "🕐 No activity for 5+ minutes\n";
-      stuckMsg += "⏱️ Uptime: " + String(millis() / 60000) + " min\n";
-      stuckMsg += "🔄 System restarting automatically...\n";
-      stuckMsg += "📍 IP: " + WiFi.localIP().toString();
-      
-      bool sent = bot.sendMessage(CHAT_ID, stuckMsg, "");
-      Serial.print("📤 System stuck alert sent: "); Serial.println(sent ? "✅ Success" : "❌ Failed");
-      delay(1000);
-    }
-    
-    // Always indicate error with LED (3 blinks = system stuck)
-    indicateError(3, 3);  // 3 blinks, repeat 3 times
-    
-    ESP.restart();
-  }
+  delay(100);
 }
-
  
