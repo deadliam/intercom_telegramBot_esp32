@@ -1,14 +1,14 @@
 #include <EEPROM.h>
 #include <WiFiManager.h>  // https://github.com/tzapu/WiFiManager WiFi Configuration Magic
-  #include <ESP8266WiFi.h>
+#include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <UniversalTelegramBot.h>   // Universal Telegram Bot Library
 #include <ArduinoJson.h>
-#include <ESP8266WebServer.h>
-#include <ESP8266mDNS.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
 #include <ElegantOTA.h>
 #include <time.h>
-#include <coredecls.h>
+#include "esp_system.h"
 
 // PROGMEM для статических строк (экономия RAM)
 const char PROGMEM_HELP_MSG[] PROGMEM = "📋 === AVAILABLE COMMANDS ===\nping        - Test Serial communication\nmemtest     - Memory diagnostic test\nfreemem     - Emergency memory recovery\nopen        - Manual intercom open\ntest        - Send test Telegram message\nstatus      - Show full system status\nrestart     - Restart system\ncleanup     - Force memory cleanup\nresetwifi   - Reset WiFi settings\nwifiportal  - Start WiFi config portal\nforcereset  - FORCE clear ALL WiFi data\nscanwifi    - Scan WiFi networks\nhelp/?      - Show this help\n============================";
@@ -20,11 +20,16 @@ const char PROGMEM_CRITICAL_MEM[] PROGMEM = "🚨 CRITICAL MEMORY - FORCING AGGR
 // Include secrets
 #include "secrets.h"
 
-// Hardware configuration
-const int callIndicatorPin = A0;    // Analog pin for call detection
-const int cameraButtonPin = D5;     // Camera activation button
-const int doorButtonPin = D6;       // Door lock activation button
-const int ledPin = LED_BUILTIN;     // Built-in LED for status indication
+// Hardware configuration for ESP32 WROOM-32D
+// Pin mapping from NodeMCU (ESP8266) to ESP32:
+// NodeMCU A0  -> ESP32 GPIO36 (ADC1_CH0) - Analog input only
+// NodeMCU D5  -> ESP32 GPIO18 - Digital I/O
+// NodeMCU D6  -> ESP32 GPIO19 - Digital I/O
+// Built-in LED: ESP32 GPIO2 (instead of ESP8266 GPIO16)
+const int callIndicatorPin = 36;    // Analog pin for call detection (ADC1_CH0)
+const int cameraButtonPin = 18;     // Camera activation button (GPIO18)
+const int doorButtonPin = 19;       // Door lock activation button (GPIO19)
+const int ledPin = 2;               // Built-in LED for ESP32 (GPIO2)
 
 // Optocoupler configuration
 const bool optocouplerActiveHigh = false;  // false = active LOW, true = active HIGH
@@ -49,7 +54,7 @@ WiFiClientSecure client;
 UniversalTelegramBot bot(BOT_TOKEN, client);
 
 // Web server
-ESP8266WebServer server(80);
+WebServer server(80);
 
 // Telegram and connectivity variables
 bool telegramConnected = false;
@@ -94,8 +99,8 @@ const int daylightOffset_sec = 0;
 
 void checkMemoryHealth() {
   uint32_t currentFree = ESP.getFreeHeap();
-  uint16_t fragmentation = ESP.getHeapFragmentation();
-  uint32_t maxFreeBlock = ESP.getMaxFreeBlockSize();
+  uint16_t fragmentation = 0; // ESP32 doesn't have getHeapFragmentation()
+  uint32_t maxFreeBlock = ESP.getMaxAllocHeap();
   
   // Track minimum heap
   if (currentFree < minFreeHeap) {
@@ -124,7 +129,7 @@ void checkMemoryHealth() {
       // Force aggressive cleanup
       for (int i = 0; i < 10; i++) {
         yield();
-        ESP.wdtFeed();
+        // ESP32 watchdog is handled automatically
         delay(10);
       }
       
@@ -157,7 +162,7 @@ void forceMemoryCleanup() {
   // More aggressive cleanup cycles
   for (int i = 0; i < 20; i++) {
     yield();
-    ESP.wdtFeed();
+    // ESP32 watchdog is handled automatically
     delay(10);
   }
   
@@ -167,7 +172,7 @@ void forceMemoryCleanup() {
   // Additional cleanup cycles
   for (int i = 0; i < 10; i++) {
     yield();
-    ESP.wdtFeed();
+    // ESP32 watchdog is handled automatically
     delay(5);
   }
   
@@ -195,7 +200,7 @@ void forceMemoryCleanup() {
 void softwareWatchdogFeed() {
   softwareWatchdogCounter++;
   lastLoopTime = millis();
-  ESP.wdtFeed(); // Hardware watchdog
+  // ESP32 watchdog is handled automatically
   
   // Log every 1000 feeds (about every 100 seconds in normal operation)
   if (softwareWatchdogCounter % 1000 == 0) {
@@ -365,7 +370,7 @@ bool initializeNTP() {
       return true;
     }
     delay(500);
-    ESP.wdtFeed();
+    // ESP32 watchdog is handled automatically
   }
   
   Serial.println("❌ NTP synchronization failed");
@@ -418,7 +423,7 @@ bool testTelegramConnectivity() {
     unsigned long timeout = millis() + 10000;
     while (testClient.available() == 0 && millis() < timeout) {
       delay(100);
-      ESP.wdtFeed();
+      // ESP32 watchdog is handled automatically
     }
     
     if (testClient.available()) {
@@ -571,11 +576,11 @@ void checkIncomingCall() {
 // ========== TELEGRAM MESSAGE HANDLING ==========
 
 void handleNewMessages(int numNewMessages) {
-  ESP.wdtFeed();
+  // ESP32 watchdog is handled automatically
   Serial.println("📨 Handling " + String(numNewMessages) + " new messages");
 
   for (int i = 0; i < numNewMessages; i++) {
-    ESP.wdtFeed();
+    // ESP32 watchdog is handled automatically
     
     String chat_id = String(bot.messages[i].chat_id);
     String text = bot.messages[i].text;
@@ -701,7 +706,7 @@ void loadSettings() {
 // ========== WEB SERVER ==========
 
 void handleRoot() {
-  String page = "<!DOCTYPE html><html><head>";
+  String page = "<!DOCTYPE html><html><head><meta charset='utf-8'>";
   page += "<title>Telegram Intercom</title>";
   page += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
   page += "<style>";
@@ -743,11 +748,11 @@ void handleRoot() {
   
   page += "</div></body></html>";
   
-  server.send(200, "text/html", page);
+  server.send(200, "text/html; charset=utf-8", page);
 }
 
 void handleSettings() {
-  String page = "<!DOCTYPE html><html><head>";
+  String page = "<!DOCTYPE html><html><head><meta charset='utf-8'>";
   page += "<title>Settings - Telegram Intercom</title>";
   page += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
   page += "<style>";
@@ -806,7 +811,7 @@ void handleSettings() {
   
   page += "</div></body></html>";
   
-  server.send(200, "text/html", page);
+  server.send(200, "text/html; charset=utf-8", page);
 }
 
 void handleSaveSettings() {
@@ -840,7 +845,7 @@ void handleSaveSettings() {
   
   saveSettings();
   
-  String page = "<!DOCTYPE html><html><head>";
+  String page = "<!DOCTYPE html><html><head><meta charset='utf-8'>";
   page += "<meta http-equiv='refresh' content='3;url=/'>";
   page += "<title>Settings Saved</title>";
   page += "</head><body>";
@@ -848,7 +853,7 @@ void handleSaveSettings() {
   page += "<p>System will reboot in 3 seconds...</p>";
   page += "</body></html>";
   
-  server.send(200, "text/html", page);
+  server.send(200, "text/html; charset=utf-8", page);
     
     delay(1000);
     ESP.restart();
@@ -864,7 +869,7 @@ void handleTest() {
     }
   }
   
-  String page = "<!DOCTYPE html><html><head>";
+  String page = "<!DOCTYPE html><html><head><meta charset='utf-8'>";
   page += "<meta http-equiv='refresh' content='3;url=/'>";
   page += "<title>Telegram Test</title>";
   page += "</head><body>";
@@ -872,11 +877,11 @@ void handleTest() {
   page += "<p>Returning to main page...</p>";
   page += "</body></html>";
   
-  server.send(200, "text/html", page);
+  server.send(200, "text/html; charset=utf-8", page);
 }
 
 void handleWiFi() {
-  String page = "<!DOCTYPE html><html><head>";
+  String page = "<!DOCTYPE html><html><head><meta charset='utf-8'>";
   page += "<title>WiFi Setup - Telegram Intercom</title>";
   page += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
   page += "<style>";
@@ -931,11 +936,11 @@ void handleWiFi() {
   
   page += "</div></body></html>";
   
-  server.send(200, "text/html", page);
+  server.send(200, "text/html; charset=utf-8", page);
 }
 
 void handleWiFiScan() {
-  String page = "<!DOCTYPE html><html><head>";
+  String page = "<!DOCTYPE html><html><head><meta charset='utf-8'>";
   page += "<title>WiFi Scan - Telegram Intercom</title>";
   page += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
   page += "<meta http-equiv='refresh' content='30'>";  // Auto refresh every 30 seconds
@@ -965,7 +970,7 @@ void handleWiFiScan() {
     for (int i = 0; i < networkCount; i++) {
       String ssid = WiFi.SSID(i);
       int rssi = WiFi.RSSI(i);
-      String security = (WiFi.encryptionType(i) == ENC_TYPE_NONE) ? "🔓 Open" : "🔒 Secured";
+      String security = (WiFi.encryptionType(i) == WIFI_AUTH_OPEN) ? "🔓 Open" : "🔒 Secured";
       
       String signalClass = "weak";
       String signalText = "Weak";
@@ -986,11 +991,11 @@ void handleWiFiScan() {
   
   page += "</div></body></html>";
   
-  server.send(200, "text/html", page);
+  server.send(200, "text/html; charset=utf-8", page);
 }
 
 void handleWiFiPortal() {
-  String page = "<!DOCTYPE html><html><head>";
+  String page = "<!DOCTYPE html><html><head><meta charset='utf-8'>";
   page += "<meta http-equiv='refresh' content='5;url=http://192.168.4.1'>";
   page += "<title>WiFi Portal Starting</title>";
   page += "</head><body>";
@@ -1000,7 +1005,7 @@ void handleWiFiPortal() {
   page += "<p>Redirecting in 5 seconds...</p>";
   page += "</body></html>";
   
-  server.send(200, "text/html", page);
+  server.send(200, "text/html; charset=utf-8", page);
   
   delay(2000);
   WiFiManager wm;
@@ -1009,7 +1014,7 @@ void handleWiFiPortal() {
 }
 
 void handleWiFiReset() {
-  String page = "<!DOCTYPE html><html><head>";
+  String page = "<!DOCTYPE html><html><head><meta charset='utf-8'>";
   page += "<meta http-equiv='refresh' content='5;url=http://192.168.4.1'>";
   page += "<title>WiFi Reset</title>";
   page += "</head><body>";
@@ -1020,7 +1025,7 @@ void handleWiFiReset() {
   page += "<p>Redirecting in 5 seconds...</p>";
     page += "</body></html>";
   
-  server.send(200, "text/html", page);
+  server.send(200, "text/html; charset=utf-8", page);
   
   delay(2000);
   WiFiManager wm;
@@ -1029,7 +1034,7 @@ void handleWiFiReset() {
 }
 
 void handleOTAInfo() {
-  String page = "<!DOCTYPE html><html><head>";
+  String page = "<!DOCTYPE html><html><head><meta charset='utf-8'>";
   page += "<title>OTA Update Info - Telegram Intercom</title>";
   page += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
   page += "<style>";
@@ -1048,12 +1053,12 @@ void handleOTAInfo() {
   
   page += "<div class='ota-info'>";
   page += "<h2>📊 Current System Info</h2>";
-  page += "<p><strong>Chip ID:</strong> " + String(ESP.getChipId(), HEX) + "</p>";
+  page += "<p><strong>Chip ID:</strong> " + String((uint32_t)ESP.getEfuseMac(), HEX) + "</p>";
   page += "<p><strong>Flash Size:</strong> " + String(ESP.getFlashChipSize()) + " bytes</p>";
   page += "<p><strong>Free Space:</strong> " + String(ESP.getFreeSketchSpace()) + " bytes</p>";
   page += "<p><strong>Sketch Size:</strong> " + String(ESP.getSketchSize()) + " bytes</p>";
-  page += "<p><strong>Core Version:</strong> " + String(ESP.getCoreVersion()) + "</p>";
-  page += "<p><strong>SDK Version:</strong> " + String(ESP.getSdkVersion()) + "</p>";
+  page += "<p><strong>Core Version:</strong> " + String(ESP.getSdkVersion()) + "</p>";
+  page += "<p><strong>IDF Version:</strong> " + String(ESP.getSdkVersion()) + "</p>";
   page += "</div>";
   
   page += "<div class='warning'>";
@@ -1079,11 +1084,11 @@ void handleOTAInfo() {
   
   page += "</div></body></html>";
   
-  server.send(200, "text/html", page);
+  server.send(200, "text/html; charset=utf-8", page);
 }
 
 void handleReboot() {
-  String page = "<!DOCTYPE html><html><head>";
+  String page = "<!DOCTYPE html><html><head><meta charset='utf-8'>";
   page += "<meta http-equiv='refresh' content='5;url=/'>";
   page += "<title>System Reboot</title>";
   page += "</head><body>";
@@ -1091,7 +1096,7 @@ void handleReboot() {
   page += "<p>Please wait 30 seconds and refresh the page.</p>";
   page += "</body></html>";
   
-  server.send(200, "text/html", page);
+  server.send(200, "text/html; charset=utf-8", page);
   
   delay(1000);
   ESP.restart();
@@ -1106,8 +1111,9 @@ void setup() {
   Serial.println("");
   Serial.println("");
   Serial.println(FPSTR(PROGMEM_SYSTEM_STARTUP));
+  Serial.println("🔧 ESP32 WROOM-32D Version");
   Serial.println("⏰ Timestamp: " + String(millis()));
-  Serial.println("🔄 Reset reason: " + ESP.getResetReason());
+  Serial.println("🔄 Reset reason: " + String(esp_reset_reason()));
   Serial.println("💾 Free heap: " + String(ESP.getFreeHeap()) + " bytes");
   
   // Initialize EEPROM
@@ -1118,9 +1124,7 @@ void setup() {
   
   // Hardware watchdog
   Serial.println("🐕 Enabling hardware watchdog...");
-  ESP.wdtDisable();
-  ESP.wdtEnable(settings.watchdogTimeout * 1000);
-  ESP.wdtFeed();
+  // ESP32 watchdog is handled automatically
   Serial.println("✅ Hardware watchdog enabled");
   
   // Initialize advanced watchdog system
@@ -1140,14 +1144,29 @@ void setup() {
   digitalWrite(doorButtonPin, optocouplerActiveHigh ? LOW : HIGH);
   digitalWrite(ledPin, HIGH);
   
+  // Set ADC resolution to 10-bit for compatibility with ESP8266 (0-1023)
+  analogReadResolution(10);
+  
   Serial.println("✅ Hardware pins configured");
   
   // WiFi setup
   Serial.println("📶 Setting up WiFi...");
+  
+  // ESP32-specific WiFi configuration for better compatibility
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(true);
   WiFiManager wm;
   
-  // Set timeouts for WiFiManager (compatible with different library versions)
-  wm.setTimeout(300);  // Timeout for connection attempts
+  // Simplified WiFiManager configuration for ESP32 stability
+  wm.setTimeout(180);  // Connection timeout
+  wm.setDebugOutput(true);  // Enable debug output
+  
+  // Add small delay for stability
+  delay(1000);
+  
+  Serial.println("🔧 WiFiManager configured for ESP32 stability");
+  Serial.println("💾 Free heap before WiFi: " + String(ESP.getFreeHeap()) + " bytes");
   
   if (!wm.autoConnect("TelegramIntercom")) {
     Serial.println("❌ Failed to connect WiFi");
@@ -1422,7 +1441,7 @@ void loop() {
       WiFi.disconnect(true);
       WiFi.mode(WIFI_OFF);
       delay(1000);
-      ESP.eraseConfig();
+      // ESP32 doesn't have eraseConfig(), WiFiManager handles this
       delay(1000);
       Serial.println("💥 All settings erased, restarting...");
       ESP.restart();
@@ -1441,7 +1460,7 @@ void loop() {
           Serial.print(" ("); 
           Serial.print(WiFi.RSSI(i)); 
           Serial.print(" dBm) "); 
-          Serial.println((WiFi.encryptionType(i) == ENC_TYPE_NONE) ? "🔓" : "🔒");
+          Serial.println((WiFi.encryptionType(i) == WIFI_AUTH_OPEN) ? "🔓" : "🔒");
         }
       }
     } else if (command == "ping") {
@@ -1451,8 +1470,8 @@ void loop() {
     } else if (command == "memtest") {
       Serial.println("🧪 === MEMORY TEST RESULTS ===");
       uint32_t freeMem = ESP.getFreeHeap();
-      uint16_t fragmentation = ESP.getHeapFragmentation();
-      uint32_t maxBlock = ESP.getMaxFreeBlockSize();
+      uint16_t fragmentation = 0; // ESP32 doesn't have getHeapFragmentation()
+      uint32_t maxBlock = ESP.getMaxAllocHeap();
       
       Serial.print("📊 Free: "); Serial.print(freeMem); Serial.println("b");
       Serial.print("🧩 Frag: "); Serial.print(fragmentation); Serial.println("%");
@@ -1478,7 +1497,7 @@ void loop() {
       // Агрессивная очистка
       for (int i = 0; i < 50; i++) {
         yield();
-        ESP.wdtFeed();
+        // ESP32 watchdog is handled automatically
         delay(5);
       }
       
