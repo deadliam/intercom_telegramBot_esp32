@@ -31,8 +31,7 @@ const int cameraButtonPin = 18;     // Camera activation button (GPIO18)
 const int doorButtonPin = 19;       // Door lock activation button (GPIO19)
 const int ledPin = 2;               // Built-in LED for ESP32 (GPIO2)
 
-// Optocoupler configuration
-const bool optocouplerActiveHigh = false;  // false = active LOW, true = active HIGH
+// Outputs are active-HIGH (idle LOW, activation HIGH)
 
 // Settings structure for EEPROM
 struct IntercomSettings {
@@ -42,6 +41,7 @@ struct IntercomSettings {
   int doorActivationTime;     // Door activation time in ms
   char botToken[50];          // Telegram bot token
   char chatId[20];            // Telegram Chat ID
+  char authorizedChats[200];  // CSV of extra authorized chat IDs
   unsigned long rebootCount;   // Count of system reboots
   unsigned long lastUptime;    // Last uptime before reboot (minutes)
   int watchdogTimeout;        // Hardware watchdog timeout in seconds
@@ -55,6 +55,68 @@ UniversalTelegramBot bot(BOT_TOKEN, client);
 
 // Web server
 WebServer server(80);
+
+// Authorization helper for multiple Telegram users
+static bool chatIdInCsv(const char* csv, const String& chatId) {
+  if (!csv || !csv[0]) return false;
+  String needle = chatId;
+  // scan comma-separated list tolerant to spaces
+  const char* p = csv;
+  String token;
+  while (*p) {
+    // collect token
+    token = "";
+    while (*p && *p != ',') { token += *p++; }
+    token.trim();
+    if (token.length() > 0 && token == needle) return true;
+    if (*p == ',') p++;
+  }
+  return false;
+}
+
+bool isAuthorized(const String &chatId) {
+  // Primary admin from secrets
+  if (chatId == CHAT_ID) return true;
+  // Also allow admin configured in EEPROM (settings.chatId) if present
+  if (settings.chatId[0] != '\0' && chatId == String(settings.chatId)) return true;
+  // Extra authorized list from EEPROM CSV
+  return chatIdInCsv(settings.authorizedChats, chatId);
+}
+
+bool addAuthorizedChatId(const String& chatId) {
+  if (chatId.length() == 0) return false;
+  if (isAuthorized(chatId)) return true;
+  // Append to CSV if space allows
+  String current = String(settings.authorizedChats);
+  if (current.length() > 0) current += ",";
+  current += chatId;
+  if (current.length() >= sizeof(settings.authorizedChats)) return false;
+  current.toCharArray(settings.authorizedChats, sizeof(settings.authorizedChats));
+  saveSettings();
+  return true;
+}
+
+bool removeAuthorizedChatId(const String& chatId) {
+  String current = String(settings.authorizedChats);
+  if (current.length() == 0) return true;
+  // Rebuild CSV excluding chatId
+  String rebuilt = "";
+  int start = 0;
+  while (start < (int)current.length()) {
+    int comma = current.indexOf(',', start);
+    if (comma < 0) comma = current.length();
+    String token = current.substring(start, comma);
+    token.trim();
+    if (token.length() > 0 && token != chatId) {
+      if (rebuilt.length() > 0) rebuilt += ",";
+      rebuilt += token;
+    }
+    start = comma + 1;
+  }
+  rebuilt.toCharArray(settings.authorizedChats, sizeof(settings.authorizedChats));
+  saveSettings();
+  return true;
+}
 
 // Telegram and connectivity variables
 bool telegramConnected = false;
@@ -72,6 +134,8 @@ int workingTelegramPort = 433;  // Default port
 bool callDetected = false;
 bool lastCallState = false;
 unsigned long lastCallTime = 0;
+bool suppressCallDetection = false; // Disable call detection during door opening
+unsigned long ignoreCallUntil = 0;  // Time until which incoming call detection is ignored
 
 // Memory monitoring
 unsigned long lastMemoryCheck = 0;
@@ -482,40 +546,63 @@ bool reconnectTelegram() {
 
 void pressCameraButton() {
   Serial.println("🎥 === CAMERA BUTTON PRESS ===");
-  Serial.println("Changing camera pin " + String(cameraButtonPin) + " to " + String(optocouplerActiveHigh ? "HIGH" : "LOW"));
+  Serial.println("Changing camera pin " + String(cameraButtonPin) + " to HIGH");
   
-  digitalWrite(cameraButtonPin, optocouplerActiveHigh ? HIGH : LOW);
+  digitalWrite(cameraButtonPin, HIGH);
   delay(settings.cameraActivationTime);
-  digitalWrite(cameraButtonPin, optocouplerActiveHigh ? LOW : HIGH);
+  digitalWrite(cameraButtonPin, LOW);
   
-  Serial.println("Changing camera pin " + String(cameraButtonPin) + " to " + String(optocouplerActiveHigh ? "LOW" : "HIGH"));
+  Serial.println("Changing camera pin " + String(cameraButtonPin) + " to LOW");
   Serial.println("🎥 === CAMERA BUTTON RELEASE ===");
+}
+
+void viewDisplayOnly() {
+  beginCriticalOperation("View Display Only");
+  suppressCallDetection = true;
+  pressCameraButton();
+  endCriticalOperation("View Display Only");
+  suppressCallDetection = false;
+  // Ignore incoming call detection for 32 seconds after turning display on
+  ignoreCallUntil = millis() + 32000UL;
 }
 
 void pressDoorButton() {
   Serial.println("🚪 === DOOR BUTTON PRESS ===");
-  Serial.println("Changing door pin " + String(doorButtonPin) + " to " + String(optocouplerActiveHigh ? "HIGH" : "LOW"));
+  Serial.println("Changing door pin " + String(doorButtonPin) + " to HIGH");
   
-  digitalWrite(doorButtonPin, optocouplerActiveHigh ? HIGH : LOW);
+  digitalWrite(doorButtonPin, HIGH);
   delay(settings.doorActivationTime);
-  digitalWrite(doorButtonPin, optocouplerActiveHigh ? LOW : HIGH);
+  digitalWrite(doorButtonPin, LOW);
   
-  Serial.println("Changing door pin " + String(doorButtonPin) + " to " + String(optocouplerActiveHigh ? "LOW" : "HIGH"));
+  Serial.println("Changing door pin " + String(doorButtonPin) + " to LOW");
   Serial.println("🚪 === DOOR BUTTON RELEASE ===");
 }
 
 void openIntercom() {
   beginCriticalOperation("Intercom Opening");
+  suppressCallDetection = true; // Ignore call detection while opening
+  bool displayCurrentlyOn = (digitalRead(cameraButtonPin) == HIGH) || (millis() < ignoreCallUntil);
+  bool pressedCameraThisCycle = false;
   
   // Check memory before each critical step
   uint32_t freeMem = ESP.getFreeHeap();
   if (freeMem < CRITICAL_MEMORY_THRESHOLD) {
     Serial.println("🚨 CRITICAL MEMORY - Aborting intercom operation!");
     endCriticalOperation("Intercom Opening - ABORTED");
+    suppressCallDetection = false;
     return;
   }
   
-  pressCameraButton();
+  // If display is already on (or recently turned on), skip camera press to avoid toggling it off
+  if (!displayCurrentlyOn) {
+    pressCameraButton();
+    pressedCameraThisCycle = true;
+    // When we turn on the display here, ignore incoming call detection for 32s
+    unsigned long newIgnoreUntil = millis() + 32000UL;
+    if (newIgnoreUntil > ignoreCallUntil) {
+      ignoreCallUntil = newIgnoreUntil;
+    }
+  }
   
   // Safe delay with watchdog feeding and memory check
   softwareWatchdogFeed();
@@ -526,6 +613,7 @@ void openIntercom() {
   if (freeMem < CRITICAL_MEMORY_THRESHOLD) {
     Serial.println("🚨 CRITICAL MEMORY after camera - Aborting door operation!");
     endCriticalOperation("Intercom Opening - PARTIAL");
+    suppressCallDetection = false;
     return;
   }
   
@@ -533,9 +621,26 @@ void openIntercom() {
   pressDoorButton();
   
   endCriticalOperation("Intercom Opening");
+  // Set/extend ignore window before lifting suppression to avoid race
+  if (pressedCameraThisCycle) {
+    // Already set to 32s above; keep it as-is
+  } else {
+    // If we didn't press camera now, still add a small tail to avoid relay noise
+    unsigned long tail = millis() + 2000UL;
+    if (tail > ignoreCallUntil) {
+      ignoreCallUntil = tail;
+    }
+  }
+  suppressCallDetection = false; // Re-enable call detection after ignore window is set
 }
 
 void checkIncomingCall() {
+  unsigned long nowTs = millis();
+  if (suppressCallDetection || (nowTs < ignoreCallUntil)) {
+    // Skip call detection while door/camera operation is in progress
+    lastCallState = false;
+    return;
+  }
   int analogValue = analogRead(callIndicatorPin);
   bool currentCallState = (analogValue < settings.callThreshold);
   
@@ -553,7 +658,8 @@ void checkIncomingCall() {
   }
   
   if (currentCallState && !lastCallState && 
-      (millis() - lastCallTime > settings.callDebounceTime)) {
+      (nowTs - lastCallTime > settings.callDebounceTime) &&
+      (nowTs >= ignoreCallUntil)) {
     
       callDetected = true;
       lastCallTime = millis();
@@ -588,9 +694,13 @@ void handleNewMessages(int numNewMessages) {
 
     Serial.println("📩 Message from " + from_name + " (" + chat_id + "): " + text);
 
-    if (chat_id != CHAT_ID) {
-      bot.sendMessage(chat_id, "❌ Unauthorized access", "");
-      Serial.println("⚠️ Unauthorized user blocked");
+    if (!isAuthorized(chat_id)) {
+      String unauthMsg = "❌ Unauthorized access\n\n";
+      unauthMsg += "Your chat_id: ";
+      unauthMsg += chat_id;
+      unauthMsg += "\nAsk admin to add it to whitelist.";
+      bot.sendMessage(chat_id, unauthMsg, "");
+      Serial.println("⚠️ Unauthorized user blocked, chat_id=" + chat_id);
       continue;
     }
 
@@ -602,9 +712,15 @@ void handleNewMessages(int numNewMessages) {
       welcome += "📞 Call detection threshold: " + String(settings.callThreshold) + "\n\n";
       welcome += "📋 *Available Commands:*\n";
       welcome += "/start - Show this menu\n";
-      welcome += "/status - System status";
+      welcome += "/status - System status\n";
+      if (chat_id == CHAT_ID) {
+        welcome += "\n*Admin commands:*\n";
+        welcome += "/allow <chat_id> - Add user\n";
+        welcome += "/deny <chat_id> - Remove user\n";
+        welcome += "/list - List authorized\n";
+      }
 
-      String replyKeyboard = "[[\"🚪 Open Intercom\"], [\"📊 Status\"]]";
+      String replyKeyboard = "[[\"🚪 Open Intercom\", \"📺 View Display\"], [\"📊 Status\"]]";
       bot.sendMessageWithReplyKeyboard(chat_id, welcome, "", replyKeyboard, true, false, false);
       
     } else if (text == "🚪 Open Intercom") {
@@ -619,6 +735,29 @@ void handleNewMessages(int numNewMessages) {
       confirmMsg += "⏰ Time: " + String(millis() / 60000) + " min uptime";
       
       bot.sendMessage(chat_id, confirmMsg, "Markdown");
+      
+    } else if (text == "📺 View Display") {
+      Serial.println("📺 View Display command received");
+      bot.sendMessage(chat_id, "🎥 Turning on display...", "");
+      viewDisplayOnly();
+      bot.sendMessage(chat_id, "✅ Display turned on", "");
+    } else if (text.startsWith("/allow")) {
+      if (chat_id != CHAT_ID) { bot.sendMessage(chat_id, "❌ Admin only", ""); continue; }
+      String parts = text; parts.replace("/allow",""); parts.trim();
+      if (parts.length() == 0) { bot.sendMessage(chat_id, "Usage: /allow <chat_id>", ""); continue; }
+      bool ok = addAuthorizedChatId(parts);
+      bot.sendMessage(chat_id, ok ? ("✅ Added: " + parts) : "❌ Failed to add (no space?)", "");
+    } else if (text.startsWith("/deny")) {
+      if (chat_id != CHAT_ID) { bot.sendMessage(chat_id, "❌ Admin only", ""); continue; }
+      String parts = text; parts.replace("/deny",""); parts.trim();
+      if (parts.length() == 0) { bot.sendMessage(chat_id, "Usage: /deny <chat_id>", ""); continue; }
+      bool ok = removeAuthorizedChatId(parts);
+      bot.sendMessage(chat_id, ok ? ("✅ Removed: " + parts) : "❌ Failed to remove", "");
+    } else if (text == "/list") {
+      if (chat_id != CHAT_ID) { bot.sendMessage(chat_id, "❌ Admin only", ""); continue; }
+      String list = String(settings.authorizedChats);
+      if (list.length() == 0) list = "<empty>";
+      bot.sendMessage(chat_id, "👥 Authorized: " + list, "");
       
     } else if (text == "/status" || text == "📊 Status") {
       Serial.println("📊 Status command received - OPTIMIZED VERSION");
@@ -657,7 +796,7 @@ void handleNewMessages(int numNewMessages) {
       statusMsg += String(millis() / 60000);
       statusMsg += " min";
       
-      String replyKeyboard = "[[\"🚪 Open Intercom\"], [\"📊 Status\"]]";
+      String replyKeyboard = "[[\"🚪 Open Intercom\", \"📺 View Display\"], [\"📊 Status\"]]";
       bot.sendMessageWithReplyKeyboard(chat_id, statusMsg, "Markdown", replyKeyboard, true, false, false);
       
     } else {
@@ -685,11 +824,12 @@ void loadSettings() {
     
     // Load default settings
     settings.cameraActivationTime = 2000;
-    settings.callThreshold = 200;
+    settings.callThreshold = 15;
     settings.callDebounceTime = 5000;
-    settings.doorActivationTime = 200;
+    settings.doorActivationTime = 500;
     strncpy(settings.botToken, BOT_TOKEN, sizeof(settings.botToken) - 1);
     strncpy(settings.chatId, CHAT_ID, sizeof(settings.chatId) - 1);
+    settings.authorizedChats[0] = '\0';
     settings.rebootCount = 1;
     settings.lastUptime = 0;
     settings.watchdogTimeout = 8;
@@ -699,6 +839,13 @@ void loadSettings() {
   } else {
     settings.rebootCount++;
     settings.lastUptime = millis() / 60000;
+    // sanitize CSV
+    bool ok = true;
+    for (size_t i = 0; i < sizeof(settings.authorizedChats) && settings.authorizedChats[i]; ++i) {
+      char c = settings.authorizedChats[i];
+      if (!(c == ',' || c == ' ' || (c >= '0' && c <= '9') || c == '+' || c == '-')) { ok = false; break; }
+    }
+    if (!ok) settings.authorizedChats[0] = '\0';
     saveSettings();
   }
 }
@@ -785,15 +932,15 @@ void handleSettings() {
   page += "<div class='setting'>";
   page += "<h3>🚪 Door Settings</h3>";
   page += "<label>Door Activation Time (ms): </label>";
-  page += "<input type='number' name='doorTime' value='" + String(settings.doorActivationTime) + "' min='50' max='5000'>";
-  page += "<small> (50-5000ms)</small>";
+  page += "<input type='number' name='doorTime' value='" + String(settings.doorActivationTime) + "' min='500' max='5000'>";
+  page += "<small> (500-5000ms)</small>";
   page += "</div>";
   
   page += "<div class='setting'>";
   page += "<h3>📞 Call Detection</h3>";
   page += "<label>Call Threshold (A0 value): </label>";
   page += "<input type='number' name='threshold' value='" + String(settings.callThreshold) + "' min='0' max='1023'>";
-  page += "<small> (0-1023, current A0: " + String(analogRead(callIndicatorPin)) + ")</small><br><br>";
+  page += "<small> (рекомендуется 10–20, current A0: " + String(analogRead(callIndicatorPin)) + ")</small><br><br>";
   page += "<label>Call Debounce Time (ms): </label>";
   page += "<input type='number' name='debounce' value='" + String(settings.callDebounceTime) + "' min='1000' max='60000'>";
   page += "<small> (1000-60000ms)</small>";
@@ -834,7 +981,7 @@ void handleSaveSettings() {
   // Validate settings
   if (settings.cameraActivationTime < 100) settings.cameraActivationTime = 100;
   if (settings.cameraActivationTime > 10000) settings.cameraActivationTime = 10000;
-  if (settings.doorActivationTime < 50) settings.doorActivationTime = 50;
+  if (settings.doorActivationTime < 500) settings.doorActivationTime = 500;
   if (settings.doorActivationTime > 5000) settings.doorActivationTime = 5000;
   if (settings.callThreshold < 0) settings.callThreshold = 0;
   if (settings.callThreshold > 1023) settings.callThreshold = 1023;
@@ -1140,8 +1287,8 @@ void setup() {
   pinMode(doorButtonPin, OUTPUT);
   pinMode(ledPin, OUTPUT);
   
-  digitalWrite(cameraButtonPin, optocouplerActiveHigh ? LOW : HIGH);
-  digitalWrite(doorButtonPin, optocouplerActiveHigh ? LOW : HIGH);
+  digitalWrite(cameraButtonPin, LOW);
+  digitalWrite(doorButtonPin, LOW);
   digitalWrite(ledPin, HIGH);
   
   // Set ADC resolution to 10-bit for compatibility with ESP8266 (0-1023)
@@ -1240,7 +1387,7 @@ void setup() {
     startupMsg += "IP: " + WiFi.localIP().toString() + "\n";
     startupMsg += "Boot #" + String(settings.rebootCount) + " Ready!";
     
-    String replyKeyboard = "[[\"🚪 Open Intercom\"]]";
+    String replyKeyboard = "[[\"🚪 Open Intercom\", \"📺 View Display\"]]";
     bool sent = bot.sendMessageWithReplyKeyboard(CHAT_ID, startupMsg, "", replyKeyboard, true, false, false);
     Serial.println("📤 Startup notification: " + String(sent ? "✅ Sent" : "❌ Failed"));
     
