@@ -45,9 +45,24 @@ struct IntercomSettings {
   unsigned long rebootCount;   // Count of system reboots
   unsigned long lastUptime;    // Last uptime before reboot (minutes)
   int watchdogTimeout;        // Hardware watchdog timeout in seconds
+  uint8_t intercomType;       // 0 = full (display + camera button + call detect), 1 = simple (door only)
 };
 
 IntercomSettings settings;
+
+#define INTERCOM_FULL   0
+#define INTERCOM_SIMPLE 1
+
+// Simple intercoms have no screen: only the door output (solid-state relay) is used
+inline bool hasDisplay() { return settings.intercomType != INTERCOM_SIMPLE; }
+
+// Telegram reply keyboard depending on intercom type
+String mainKeyboard(bool withStatus) {
+  String kb = hasDisplay() ? "[[\"🚪 Open Intercom\", \"📺 View Display\"]" : "[[\"🚪 Open Intercom\"]";
+  if (withStatus) kb += ", [\"📊 Status\"]";
+  kb += "]";
+  return kb;
+}
 
 // Telegram Bot Setup
 WiFiClientSecure client;
@@ -557,6 +572,7 @@ void pressCameraButton() {
 }
 
 void viewDisplayOnly() {
+  if (!hasDisplay()) { Serial.println("ℹ️ Simple intercom: no display, ignoring"); return; }
   beginCriticalOperation("View Display Only");
   suppressCallDetection = true;
   pressCameraButton();
@@ -581,7 +597,8 @@ void pressDoorButton() {
 void openIntercom() {
   beginCriticalOperation("Intercom Opening");
   suppressCallDetection = true; // Ignore call detection while opening
-  bool displayCurrentlyOn = (digitalRead(cameraButtonPin) == HIGH) || (millis() < ignoreCallUntil);
+  // Simple intercom (no screen): never touch the camera/display output
+  bool displayCurrentlyOn = !hasDisplay() || (digitalRead(cameraButtonPin) == HIGH) || (millis() < ignoreCallUntil);
   bool pressedCameraThisCycle = false;
   
   // Check memory before each critical step
@@ -617,7 +634,7 @@ void openIntercom() {
     return;
   }
   
-  delay(500);
+  if (hasDisplay()) delay(500);
   pressDoorButton();
   
   endCriticalOperation("Intercom Opening");
@@ -635,6 +652,7 @@ void openIntercom() {
 }
 
 void checkIncomingCall() {
+  if (!hasDisplay()) return; // Simple intercom has no call detection input
   unsigned long nowTs = millis();
   if (suppressCallDetection || (nowTs < ignoreCallUntil)) {
     // Skip call detection while door/camera operation is in progress
@@ -707,9 +725,13 @@ void handleNewMessages(int numNewMessages) {
     if (text == "/start") {
       String welcome = "🏠 *Telegram Intercom System*\n\n";
       welcome += "Welcome! Use the button below to open the intercom:\n\n";
-      welcome += "🎥 Camera will activate for " + String(settings.cameraActivationTime) + "ms\n";
-      welcome += "🚪 Door will unlock for " + String(settings.doorActivationTime) + "ms\n";
-      welcome += "📞 Call detection threshold: " + String(settings.callThreshold) + "\n\n";
+      if (hasDisplay()) {
+        welcome += "🎥 Camera will activate for " + String(settings.cameraActivationTime) + "ms\n";
+        welcome += "🚪 Door will unlock for " + String(settings.doorActivationTime) + "ms\n";
+        welcome += "📞 Call detection threshold: " + String(settings.callThreshold) + "\n\n";
+      } else {
+        welcome += "🚪 Door will unlock for " + String(settings.doorActivationTime) + "ms\n\n";
+      }
       welcome += "📋 *Available Commands:*\n";
       welcome += "/start - Show this menu\n";
       welcome += "/status - System status\n";
@@ -720,23 +742,23 @@ void handleNewMessages(int numNewMessages) {
         welcome += "/list - List authorized\n";
       }
 
-      String replyKeyboard = "[[\"🚪 Open Intercom\", \"📺 View Display\"], [\"📊 Status\"]]";
+      String replyKeyboard = mainKeyboard(true);
       bot.sendMessageWithReplyKeyboard(chat_id, welcome, "", replyKeyboard, true, false, false);
       
     } else if (text == "🚪 Open Intercom") {
       Serial.println("🚪 Remote open command received");
       
-      bot.sendMessage(chat_id, "🎥 Activating camera and opening door...", "");
+      bot.sendMessage(chat_id, hasDisplay() ? "🎥 Activating camera and opening door..." : "🚪 Opening door...", "");
       openIntercom();
       
       String confirmMsg = "✅ *Intercom Opened Successfully*\n\n";
-      confirmMsg += "🎥 Camera activated for " + String(settings.cameraActivationTime) + "ms\n";
+      if (hasDisplay()) confirmMsg += "🎥 Camera activated for " + String(settings.cameraActivationTime) + "ms\n";
       confirmMsg += "🚪 Door unlocked for " + String(settings.doorActivationTime) + "ms\n";
       confirmMsg += "⏰ Time: " + String(millis() / 60000) + " min uptime";
       
       bot.sendMessage(chat_id, confirmMsg, "Markdown");
       
-    } else if (text == "📺 View Display") {
+    } else if (text == "📺 View Display" && hasDisplay()) {
       Serial.println("📺 View Display command received");
       bot.sendMessage(chat_id, "🎥 Turning on display...", "");
       viewDisplayOnly();
@@ -796,7 +818,7 @@ void handleNewMessages(int numNewMessages) {
       statusMsg += String(millis() / 60000);
       statusMsg += " min";
       
-      String replyKeyboard = "[[\"🚪 Open Intercom\", \"📺 View Display\"], [\"📊 Status\"]]";
+      String replyKeyboard = mainKeyboard(true);
       bot.sendMessageWithReplyKeyboard(chat_id, statusMsg, "Markdown", replyKeyboard, true, false, false);
       
     } else {
@@ -833,10 +855,13 @@ void loadSettings() {
     settings.rebootCount = 1;
     settings.lastUptime = 0;
     settings.watchdogTimeout = 8;
+    settings.intercomType = INTERCOM_FULL;
     
     Serial.println("⚙️ Loading default settings");
     saveSettings();
   } else {
+    // Older firmware did not store the type: unknown value -> full intercom
+    if (settings.intercomType > INTERCOM_SIMPLE) settings.intercomType = INTERCOM_FULL;
     settings.rebootCount++;
     settings.lastUptime = millis() / 60000;
     // sanitize CSV
@@ -923,6 +948,15 @@ void handleSettings() {
   page += "<form method='POST' action='/save'>";
   
   page += "<div class='setting'>";
+  page += "<h3>🏢 Intercom Type</h3>";
+  page += "<select name='intercomType'>";
+  page += String("<option value='0'") + (settings.intercomType == INTERCOM_FULL ? " selected" : "") + ">Full — screen + camera button + call detection</option>";
+  page += String("<option value='1'") + (settings.intercomType == INTERCOM_SIMPLE ? " selected" : "") + ">Simple — no screen, only 'Open door' (solid-state relay)</option>";
+  page += "</select>";
+  page += "<small><br>Simple type disables the camera/display output and incoming call detection.</small>";
+  page += "</div>";
+  
+  page += "<div class='setting'>";
   page += "<h3>🎥 Camera Settings</h3>";
   page += "<label>Camera Activation Time (ms): </label>";
   page += "<input type='number' name='cameraTime' value='" + String(settings.cameraActivationTime) + "' min='100' max='10000'>";
@@ -962,6 +996,10 @@ void handleSettings() {
 }
 
 void handleSaveSettings() {
+  if (server.hasArg("intercomType")) {
+    int t = server.arg("intercomType").toInt();
+    settings.intercomType = (t == INTERCOM_SIMPLE) ? INTERCOM_SIMPLE : INTERCOM_FULL;
+  }
   if (server.hasArg("cameraTime")) {
     settings.cameraActivationTime = server.arg("cameraTime").toInt();
   }
@@ -1387,7 +1425,7 @@ void setup() {
     startupMsg += "IP: " + WiFi.localIP().toString() + "\n";
     startupMsg += "Boot #" + String(settings.rebootCount) + " Ready!";
     
-    String replyKeyboard = "[[\"🚪 Open Intercom\", \"📺 View Display\"]]";
+    String replyKeyboard = mainKeyboard(false);
     bool sent = bot.sendMessageWithReplyKeyboard(CHAT_ID, startupMsg, "", replyKeyboard, true, false, false);
     Serial.println("📤 Startup notification: " + String(sent ? "✅ Sent" : "❌ Failed"));
     
