@@ -1,4 +1,5 @@
 secrets.h
 nodemcu_telegram/secrets.h
+build/
 
 
