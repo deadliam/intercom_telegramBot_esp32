@@ -1,1712 +1,1202 @@
-#include <EEPROM.h>
-#include <WiFiManager.h>  // https://github.com/tzapu/WiFiManager WiFi Configuration Magic
+// Telegram Intercom — ESP32 / ESP32-C3
+// Web portal (plain HTML), WiFiManager, ElegantOTA, mDNS (<host>.local)
+// All secrets (bot token, users, web password) are entered in the web portal
+// and stored in NVS — nothing secret is compiled into the firmware.
+
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
-#include <UniversalTelegramBot.h>   // Universal Telegram Bot Library
-#include <ArduinoJson.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
+#include <Preferences.h>
+#include <EEPROM.h>
+#include <WiFiManager.h>          // https://github.com/tzapu/WiFiManager
+#include <UniversalTelegramBot.h>
 #include <ElegantOTA.h>
+#include <PubSubClient.h>         // MQTT for Home Assistant
+#include <esp_task_wdt.h>
 #include <time.h>
-#include "esp_system.h"
+#include <functional>
 
-// PROGMEM для статических строк (экономия RAM)
-const char PROGMEM_HELP_MSG[] PROGMEM = "📋 === AVAILABLE COMMANDS ===\nping        - Test Serial communication\nmemtest     - Memory diagnostic test\nfreemem     - Emergency memory recovery\nopen        - Manual intercom open\ntest        - Send test Telegram message\nstatus      - Show full system status\nrestart     - Restart system\ncleanup     - Force memory cleanup\nresetwifi   - Reset WiFi settings\nwifiportal  - Start WiFi config portal\nforcereset  - FORCE clear ALL WiFi data\nscanwifi    - Scan WiFi networks\nhelp/?      - Show this help\n============================";
+#define FW_VERSION "2.1.0"
 
-const char PROGMEM_SYSTEM_STARTUP[] PROGMEM = "=== SYSTEM STARTUP ===";
-const char PROGMEM_MEMORY_CHECK[] PROGMEM = "💾 === MEMORY HEALTH CHECK ===";
-const char PROGMEM_CRITICAL_MEM[] PROGMEM = "🚨 CRITICAL MEMORY - FORCING AGGRESSIVE CLEANUP!";
+// ---------- Pins ----------
+#if CONFIG_IDF_TARGET_ESP32C3
+  #define BOARD_NAME "ESP32-C3"
+  const int PIN_DOOR   = 10;   // PhotoMOS (solid-state relay) input via 330 Ohm
+  const int PIN_CAMERA = 5;    // display/camera button (full type only)
+  const int PIN_CALL   = 3;    // ADC1_CH3, call indicator (full type only)
+  const int PIN_LED    = 8;    // on-board LED, active LOW
+  const bool LED_ACTIVE_LOW = true;
+#else
+  #define BOARD_NAME "ESP32"
+  const int PIN_DOOR   = 19;
+  const int PIN_CAMERA = 18;
+  const int PIN_CALL   = 36;   // ADC1_CH0
+  const int PIN_LED    = 2;
+  const bool LED_ACTIVE_LOW = false;
+#endif
 
-// Include secrets
-#include "secrets.h"
+#define INTERCOM_FULL   0     // screen + camera button + call detection
+#define INTERCOM_SIMPLE 1     // no screen: only "open door"
 
-// Hardware configuration for ESP32 WROOM-32D
-// Pin mapping from NodeMCU (ESP8266) to ESP32:
-// NodeMCU A0  -> ESP32 GPIO36 (ADC1_CH0) - Analog input only
-// NodeMCU D5  -> ESP32 GPIO18 - Digital I/O
-// NodeMCU D6  -> ESP32 GPIO19 - Digital I/O
-// Built-in LED: ESP32 GPIO2 (instead of ESP8266 GPIO16)
-const int callIndicatorPin = 36;    // Analog pin for call detection (ADC1_CH0)
-const int cameraButtonPin = 18;     // Camera activation button (GPIO18)
-const int doorButtonPin = 19;       // Door lock activation button (GPIO19)
-const int ledPin = 2;               // Built-in LED for ESP32 (GPIO2)
+const uint32_t DISPLAY_ON_MS   = 32000;  // intercom screen stays on this long
+const uint32_t TG_POLL_MS      = 1000;
+const uint32_t TG_CHECK_MS     = 300000; // getMe health check
+const uint32_t WDT_TIMEOUT_MS  = 60000;
+const int      LOG_SIZE        = 25;
+const long     CALL_BTN_S      = 180;    // "Open" button in a call notification works this long
+const long     CONFIRM_BTN_S   = 60;     // confirmation button works this long
+const int      REQ_GUEST_H     = 24;     // guest duration offered on an access request
+const uint32_t MQTT_RETRY_MS   = 30000;
 
-// Outputs are active-HIGH (idle LOW, activation HIGH)
+// ---------- Configuration (NVS) ----------
+struct Config {
+  String token;       // Telegram bot token
+  String admin;       // admin chat id
+  String users;       // lines: "<chat_id> <name>"
+  String guests;      // lines: "<chat_id> <expiry epoch> <name>"
+  String host;        // mDNS name -> <host>.local
+  String webPass;     // web portal / OTA password (user "admin")
+  String tz;          // POSIX TZ string
+  String mqttHost, mqttUser, mqttPass;
+  uint8_t  type;
+  uint16_t doorMs, camMs, threshold, debounceMs, maxAgeS, mqttPort;
+  bool notifyAll, tlsVerify, confirmOpen, mqttOn;
+} cfg;
 
-// Settings structure for EEPROM
-struct IntercomSettings {
-  int cameraActivationTime;    // Camera activation time in ms
-  int callThreshold;          // Threshold value for A0
-  int callDebounceTime;       // Call debounce time in ms  
-  int doorActivationTime;     // Door activation time in ms
-  char botToken[50];          // Telegram bot token
-  char chatId[20];            // Telegram Chat ID
-  char authorizedChats[200];  // CSV of extra authorized chat IDs
-  unsigned long rebootCount;   // Count of system reboots
-  unsigned long lastUptime;    // Last uptime before reboot (minutes)
-  int watchdogTimeout;        // Hardware watchdog timeout in seconds
-  uint8_t intercomType;       // 0 = full (display + camera button + call detect), 1 = simple (door only)
+Preferences prefs;
+
+enum Role { R_NONE, R_GUEST, R_USER, R_ADMIN };
+
+// ---------- Runtime state ----------
+WebServer server(80);
+WiFiClientSecure tgClient;
+UniversalTelegramBot bot("", tgClient);
+WiFiClient mqttNet;
+PubSubClient mqtt(mqttNet);
+uint32_t lastMqttTry = 0;
+bool mqttWasUp = false;
+String lastReqId; uint32_t lastReqMs = 0;   // access-request anti-spam
+
+String csrf;                   // per-boot token for POST forms
+uint32_t bootCount = 0;
+
+bool tgOk = false;
+String tgBotName;
+uint32_t lastPoll = 0, lastTgCheck = 0, lastUnauthReply = 0;
+bool tgCheckedOnce = false;
+
+uint32_t displayStart = 0, displayLen = 0;   // screen-on window
+uint32_t ignoreStart = 0, ignoreLen = 0;     // call detection blackout
+bool lastCallState = false;
+uint32_t lastCallMs = 0;
+bool busy = false;
+
+struct LogEntry { time_t t; uint32_t ms; String text; };
+LogEntry logBuf[LOG_SIZE];
+int logHead = 0, logCount = 0;
+
+// ---------- Helpers ----------
+inline bool hasDisplay() { return cfg.type != INTERCOM_SIMPLE; }
+inline bool timeValid() { return time(nullptr) > 1700000000; }
+
+void led(bool on) { digitalWrite(PIN_LED, (on ^ LED_ACTIVE_LOW) ? HIGH : LOW); }
+
+void delayWdt(uint32_t ms) {
+  uint32_t st = millis();
+  while (millis() - st < ms) { esp_task_wdt_reset(); delay(10); }
+}
+
+bool windowActive(uint32_t start, uint32_t len) { return millis() - start < len; }
+
+// Extend a [start, len) window so that it lasts at least `ms` from now (overflow-safe)
+void extendWindow(uint32_t &start, uint32_t &len, uint32_t ms) {
+  uint32_t now = millis(), el = now - start;
+  uint32_t remaining = el < len ? len - el : 0;
+  if (ms > remaining) { start = now; len = ms; }
+}
+
+String esc(const String &s) {
+  String o; o.reserve(s.length() + 8);
+  for (char c : s) {
+    switch (c) {
+      case '&': o += F("&amp;"); break;
+      case '<': o += F("&lt;"); break;
+      case '>': o += F("&gt;"); break;
+      case '"': o += F("&quot;"); break;
+      case '\'': o += F("&#39;"); break;
+      default: o += c;
+    }
+  }
+  return o;
+}
+
+String fmtUptime(uint32_t sec) {
+  uint32_t d = sec / 86400, h = sec / 3600 % 24, m = sec / 60 % 60;
+  String s; if (d) s += String(d) + " д ";
+  s += String(h) + " ч " + String(m) + " мин"; return s;
+}
+
+String fmtTime(time_t t, uint32_t ms) {
+  if (t > 1700000000) {
+    struct tm tmv; localtime_r(&t, &tmv); char b[24];
+    strftime(b, sizeof b, "%d.%m %H:%M:%S", &tmv); return String(b);
+  }
+  return "через " + fmtUptime(ms / 1000) + " после старта";
+}
+
+String mqttBase() { return "intercom/" + cfg.host; }
+
+void addLog(const String &text) {
+  logBuf[logHead] = { time(nullptr), millis(), text };
+  logHead = (logHead + 1) % LOG_SIZE;
+  if (logCount < LOG_SIZE) logCount++;
+  Serial.println("[log] " + text);
+  if (mqtt.connected()) mqtt.publish((mqttBase() + "/event").c_str(), text.c_str(), true);
+}
+
+long nowEpoch() { return timeValid() ? (long)time(nullptr) : 0; }
+
+// Name safe for callback_data / one-line storage: no quotes, backslashes, colons, control chars,
+// cut to maxBytes without splitting a UTF-8 character.
+String cleanName(const String &in, size_t maxBytes) {
+  String o;
+  for (size_t i = 0; i < in.length(); i++) {
+    unsigned char c = in[i];
+    if (c < 32 || c == '"' || c == '\\' || c == ':') continue;
+    o += (char)c;
+  }
+  o.trim();
+  if (o.length() > maxBytes) {
+    size_t cut = maxBytes;
+    while (cut > 0 && ((unsigned char)o[cut] & 0xC0) == 0x80) cut--;
+    o = o.substring(0, cut);
+  }
+  return o;
+}
+
+bool validChatId(const String &s) {
+  if (s.length() == 0 || s.length() > 20) return false;
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (!(isdigit((unsigned char)c) || (c == '-' && i == 0))) return false;
+  }
+  return s != "-";
+}
+
+bool validToken(const String &s) {
+  int colon = s.indexOf(':');
+  if (colon < 5 || s.length() - colon - 1 < 30 || s.length() > 100) return false;
+  for (int i = 0; i < colon; i++) if (!isdigit((unsigned char)s[i])) return false;
+  for (size_t i = colon + 1; i < s.length(); i++) {
+    char c = s[i];
+    if (!(isalnum((unsigned char)c) || c == '_' || c == '-')) return false;
+  }
+  return true;
+}
+
+bool validHost(const String &s) {
+  if (s.length() == 0 || s.length() > 30 || s[0] == '-' || s[s.length() - 1] == '-') return false;
+  for (char c : s) if (!(isdigit((unsigned char)c) || (c >= 'a' && c <= 'z') || c == '-')) return false;
+  return true;
+}
+
+// Iterate "id name" lines; callback returns false to stop
+void forEachUser(const String &users, std::function<bool(const String &, const String &)> cb) {
+  int s = 0, n = users.length();
+  while (s < n) {
+    int e = users.indexOf('\n', s); if (e < 0) e = n;
+    String line = users.substring(s, e); line.trim(); s = e + 1;
+    if (!line.length()) continue;
+    int sp = line.indexOf(' ');
+    String id = sp < 0 ? line : line.substring(0, sp);
+    String name = sp < 0 ? "" : line.substring(sp + 1); name.trim();
+    if (!cb(id, name)) return;
+  }
+}
+
+bool isListedUserIn(const String &users, const String &id) {
+  bool found = false;
+  forEachUser(users, [&](const String &u, const String &) { if (u == id) { found = true; return false; } return true; });
+  return found;
+}
+
+bool isListedUser(const String &id) { return isListedUserIn(cfg.users, id); }
+
+bool isAuthorized(const String &id) { return (cfg.admin.length() && id == cfg.admin) || isListedUser(id); }
+
+// ---------- Guests (temporary access) ----------
+void forEachGuest(std::function<bool(const String &, long, const String &)> cb) {
+  forEachUser(cfg.guests, [&](const String &id, const String &rest) {
+    int sp = rest.indexOf(' ');
+    long exp = (sp < 0 ? rest : rest.substring(0, sp)).toInt();
+    String name = sp < 0 ? "" : rest.substring(sp + 1);
+    return cb(id, exp, name);
+  });
+}
+
+long guestExpiry(const String &id) {
+  long exp = 0;
+  forEachGuest([&](const String &g, long e, const String &) { if (g == id) { exp = e; return false; } return true; });
+  return exp;
+}
+
+bool isGuest(const String &id) { long e = guestExpiry(id); return e > 0 && nowEpoch() > 0 && nowEpoch() < e; }
+
+String guestName(const String &id) {
+  String n;
+  forEachGuest([&](const String &g, long, const String &nm) { if (g == id) { n = nm; return false; } return true; });
+  return n;
+}
+
+// Rewrite the guest list without `dropId` and without expired entries
+void rebuildGuests(const String &dropId) {
+  String out; long now = nowEpoch();
+  forEachGuest([&](const String &g, long e, const String &n) {
+    if (g != dropId && (now == 0 || e > now)) out += g + " " + String(e) + (n.length() ? " " + n : "") + "\n";
+    return true;
+  });
+  if (out != cfg.guests) { cfg.guests = out; prefs.putString("guests", cfg.guests); }
+}
+
+bool addGuest(const String &id, int hours, const String &name) {
+  if (!validChatId(id) || !nowEpoch()) return false;
+  hours = constrain(hours, 1, 720);
+  rebuildGuests(id);
+  String n = cleanName(name, 32);
+  cfg.guests += id + " " + String(nowEpoch() + hours * 3600L) + (n.length() ? " " + n : "") + "\n";
+  prefs.putString("guests", cfg.guests);
+  return true;
+}
+
+Role roleOf(const String &id) {
+  if (cfg.admin.length() && id == cfg.admin) return R_ADMIN;
+  if (isListedUser(id)) return R_USER;
+  if (isGuest(id)) return R_GUEST;
+  return R_NONE;
+}
+
+String userLabel(const String &id, const String &fallbackName = "") {
+  if (cfg.admin.length() && id == cfg.admin) return "админ";
+  String label;
+  forEachUser(cfg.users, [&](const String &u, const String &n) { if (u == id) { label = n; return false; } return true; });
+  if (!label.length()) { String g = guestName(id); if (g.length()) label = "гость " + g; }
+  if (!label.length()) label = fallbackName;
+  return label.length() ? label + " (" + id + ")" : id;
+}
+
+String fmtUntil(long exp) {
+  time_t t = exp; struct tm tmv; localtime_r(&t, &tmv); char b[20];
+  strftime(b, sizeof b, "%d.%m %H:%M", &tmv); return String(b);
+}
+
+// Validate + normalise textarea input. Appends problems to errs.
+String normalizeUsers(const String &raw, String &errs) {
+  String out; int lineNo = 0, s = 0, n = raw.length();
+  while (s <= n) {
+    int e = raw.indexOf('\n', s); if (e < 0) e = n;
+    String line = raw.substring(s, e); line.replace("\r", ""); line.replace("\t", " "); line.trim();
+    s = e + 1; lineNo++;
+    if (!line.length() || line[0] == '#') { if (e >= n) break; continue; }
+    int sp = line.indexOf(' ');
+    String id = sp < 0 ? line : line.substring(0, sp);
+    String name = sp < 0 ? "" : line.substring(sp + 1); name.trim();
+    if (name.length() > 32) name = name.substring(0, 32);
+    if (!validChatId(id)) errs += "Строка " + String(lineNo) + ": «" + id + "» — не chat_id, пропущена. ";
+    else if (!isListedUserIn(out, id)) out += id + (name.length() ? " " + name : "") + "\n";
+    if (e >= n) break;
+  }
+  return out;
+}
+
+// ---------- Config storage ----------
+void saveConfig() {
+  prefs.putString("token", cfg.token);
+  prefs.putString("admin", cfg.admin);
+  prefs.putString("users", cfg.users);
+  prefs.putString("host", cfg.host);
+  prefs.putString("webPass", cfg.webPass);
+  prefs.putString("tz", cfg.tz);
+  prefs.putUChar("type", cfg.type);
+  prefs.putUShort("doorMs", cfg.doorMs);
+  prefs.putUShort("camMs", cfg.camMs);
+  prefs.putUShort("thresh", cfg.threshold);
+  prefs.putUShort("debMs", cfg.debounceMs);
+  prefs.putUShort("maxAge", cfg.maxAgeS);
+  prefs.putBool("notifyAll", cfg.notifyAll);
+  prefs.putBool("tlsVerify", cfg.tlsVerify);
+  prefs.putString("guests", cfg.guests);
+  prefs.putBool("confirm", cfg.confirmOpen);
+  prefs.putBool("mqttOn", cfg.mqttOn);
+  prefs.putString("mqttHost", cfg.mqttHost);
+  prefs.putUShort("mqttPort", cfg.mqttPort);
+  prefs.putString("mqttUser", cfg.mqttUser);
+  prefs.putString("mqttPass", cfg.mqttPass);
+}
+
+void loadConfig() {
+  cfg.token      = prefs.getString("token", "");
+  cfg.admin      = prefs.getString("admin", "");
+  cfg.users      = prefs.getString("users", "");
+  cfg.host       = prefs.getString("host", "intercom");
+  cfg.webPass    = prefs.getString("webPass", "");
+  cfg.tz         = prefs.getString("tz", "CET-1CEST,M3.5.0,M10.5.0/3");
+  cfg.type       = prefs.getUChar("type", INTERCOM_FULL);
+  cfg.doorMs     = prefs.getUShort("doorMs", 500);
+  cfg.camMs      = prefs.getUShort("camMs", 2000);
+  cfg.threshold  = prefs.getUShort("thresh", 15);
+  cfg.debounceMs = prefs.getUShort("debMs", 5000);
+  cfg.maxAgeS    = prefs.getUShort("maxAge", 60);
+  cfg.notifyAll  = prefs.getBool("notifyAll", false);
+  cfg.tlsVerify  = prefs.getBool("tlsVerify", true);
+  cfg.guests     = prefs.getString("guests", "");
+  cfg.confirmOpen = prefs.getBool("confirm", false);
+  cfg.mqttOn     = prefs.getBool("mqttOn", false);
+  cfg.mqttHost   = prefs.getString("mqttHost", "");
+  cfg.mqttPort   = prefs.getUShort("mqttPort", 1883);
+  cfg.mqttUser   = prefs.getString("mqttUser", "");
+  cfg.mqttPass   = prefs.getString("mqttPass", "");
+  if (cfg.type > INTERCOM_SIMPLE) cfg.type = INTERCOM_FULL;
+  if (!validHost(cfg.host)) cfg.host = "intercom";
+}
+
+// Firmware 1.x kept settings in EEPROM. Copy them once into NVS.
+struct LegacySettings {
+  int cameraActivationTime, callThreshold, callDebounceTime, doorActivationTime;
+  char botToken[50]; char chatId[20]; char authorizedChats[200];
+  unsigned long rebootCount, lastUptime; int watchdogTimeout; uint8_t intercomType;
 };
 
-IntercomSettings settings;
-
-#define INTERCOM_FULL   0
-#define INTERCOM_SIMPLE 1
-
-// Simple intercoms have no screen: only the door output (solid-state relay) is used
-inline bool hasDisplay() { return settings.intercomType != INTERCOM_SIMPLE; }
-
-// Telegram reply keyboard depending on intercom type
-String mainKeyboard(bool withStatus) {
-  String kb = hasDisplay() ? "[[\"🚪 Open Intercom\", \"📺 View Display\"]" : "[[\"🚪 Open Intercom\"]";
-  if (withStatus) kb += ", [\"📊 Status\"]";
-  kb += "]";
-  return kb;
+void migrateLegacy() {
+  LegacySettings s;
+  EEPROM.begin(sizeof(LegacySettings));
+  EEPROM.get(0, s);
+  EEPROM.end();
+  bool valid = s.cameraActivationTime >= 100 && s.cameraActivationTime <= 10000 &&
+               s.callThreshold >= 0 && s.callThreshold <= 1023 &&
+               s.callDebounceTime >= 1000 && s.callDebounceTime <= 60000 &&
+               s.watchdogTimeout >= 1 && s.watchdogTimeout <= 60;
+  if (!valid) { Serial.println("No legacy settings"); return; }
+  s.botToken[sizeof s.botToken - 1] = 0; s.chatId[sizeof s.chatId - 1] = 0;
+  s.authorizedChats[sizeof s.authorizedChats - 1] = 0;
+  cfg.camMs = s.cameraActivationTime; cfg.threshold = s.callThreshold; cfg.debounceMs = s.callDebounceTime;
+  if (s.doorActivationTime >= 100 && s.doorActivationTime <= 10000) cfg.doorMs = s.doorActivationTime;
+  if (s.intercomType <= INTERCOM_SIMPLE) cfg.type = s.intercomType;
+  if (validToken(String(s.botToken))) cfg.token = s.botToken;
+  if (validChatId(String(s.chatId))) cfg.admin = s.chatId;
+  String csv = s.authorizedChats; csv.replace(",", "\n"); String ignored;
+  cfg.users = normalizeUsers(csv, ignored);
+  bootCount = s.rebootCount;
+  Serial.println("Legacy settings migrated");
 }
 
-// Telegram Bot Setup
-WiFiClientSecure client;
-UniversalTelegramBot bot(BOT_TOKEN, client);
-
-// Web server
-WebServer server(80);
-
-// Authorization helper for multiple Telegram users
-static bool chatIdInCsv(const char* csv, const String& chatId) {
-  if (!csv || !csv[0]) return false;
-  String needle = chatId;
-  // scan comma-separated list tolerant to spaces
-  const char* p = csv;
-  String token;
-  while (*p) {
-    // collect token
-    token = "";
-    while (*p && *p != ',') { token += *p++; }
-    token.trim();
-    if (token.length() > 0 && token == needle) return true;
-    if (*p == ',') p++;
-  }
-  return false;
+// ---------- Hardware ----------
+void pulse(int pin, uint16_t ms) {
+  led(true); digitalWrite(pin, HIGH);
+  delayWdt(ms);
+  digitalWrite(pin, LOW); led(false);
 }
 
-bool isAuthorized(const String &chatId) {
-  // Primary admin from secrets
-  if (chatId == CHAT_ID) return true;
-  // Also allow admin configured in EEPROM (settings.chatId) if present
-  if (settings.chatId[0] != '\0' && chatId == String(settings.chatId)) return true;
-  // Extra authorized list from EEPROM CSV
-  return chatIdInCsv(settings.authorizedChats, chatId);
-}
+bool displayOn() { return windowActive(displayStart, displayLen); }
 
-bool addAuthorizedChatId(const String& chatId) {
-  if (chatId.length() == 0) return false;
-  if (isAuthorized(chatId)) return true;
-  // Append to CSV if space allows
-  String current = String(settings.authorizedChats);
-  if (current.length() > 0) current += ",";
-  current += chatId;
-  if (current.length() >= sizeof(settings.authorizedChats)) return false;
-  current.toCharArray(settings.authorizedChats, sizeof(settings.authorizedChats));
-  saveSettings();
+bool viewDisplay() {
+  if (!hasDisplay() || busy) return false;
+  busy = true;
+  extendWindow(ignoreStart, ignoreLen, cfg.camMs + 1000);
+  pulse(PIN_CAMERA, cfg.camMs);
+  extendWindow(displayStart, displayLen, DISPLAY_ON_MS);
+  extendWindow(ignoreStart, ignoreLen, DISPLAY_ON_MS);
+  busy = false;
   return true;
 }
 
-bool removeAuthorizedChatId(const String& chatId) {
-  String current = String(settings.authorizedChats);
-  if (current.length() == 0) return true;
-  // Rebuild CSV excluding chatId
-  String rebuilt = "";
-  int start = 0;
-  while (start < (int)current.length()) {
-    int comma = current.indexOf(',', start);
-    if (comma < 0) comma = current.length();
-    String token = current.substring(start, comma);
-    token.trim();
-    if (token.length() > 0 && token != chatId) {
-      if (rebuilt.length() > 0) rebuilt += ",";
-      rebuilt += token;
-    }
-    start = comma + 1;
+bool openDoor() {
+  if (busy) return false;
+  busy = true;
+  extendWindow(ignoreStart, ignoreLen, 60000);    // no call detection while we operate
+  if (hasDisplay() && !displayOn()) {
+    pulse(PIN_CAMERA, cfg.camMs);                  // pressing again would turn the screen off
+    extendWindow(displayStart, displayLen, DISPLAY_ON_MS);
+    delayWdt(500);
   }
-  rebuilt.toCharArray(settings.authorizedChats, sizeof(settings.authorizedChats));
-  saveSettings();
+  pulse(PIN_DOOR, cfg.doorMs);
+  ignoreLen = 0;
+  extendWindow(ignoreStart, ignoreLen, hasDisplay() && displayOn() ? DISPLAY_ON_MS : 2000);
+  busy = false;
   return true;
 }
 
-// Telegram and connectivity variables
-bool telegramConnected = false;
-unsigned long lastTelegramCheck = 0;
-unsigned long telegramReconnectAttempts = 0;
-unsigned long lastSuccessfulMessage = 0;
-unsigned long lastTimeBotRan = 0;
-const unsigned long botRequestDelay = 1000;
-
-// Auto port testing
-bool autoPortTestCompleted = false;
-int workingTelegramPort = 433;  // Default port
-
-// Call detection
-bool callDetected = false;
-bool lastCallState = false;
-unsigned long lastCallTime = 0;
-bool suppressCallDetection = false; // Disable call detection during door opening
-unsigned long ignoreCallUntil = 0;  // Time until which incoming call detection is ignored
-
-// Memory monitoring
-unsigned long lastMemoryCheck = 0;
-const unsigned long MEMORY_CHECK_INTERVAL = 5000; // Check every 5 seconds
-uint32_t minFreeHeap = 0xFFFFFFFF; // Track minimum free heap
-
-// Advanced Watchdog System
-unsigned long lastLoopTime = 0;
-unsigned long lastTelegramActivity = 0;
-unsigned long lastWiFiCheck = 0;
-const unsigned long MAX_LOOP_TIME = 10000;      // Max 10 seconds per loop
-const unsigned long MAX_TELEGRAM_SILENCE = 300000; // Max 5 minutes without Telegram
-const unsigned long CRITICAL_MEMORY_THRESHOLD = 20000; // Critical memory level
-unsigned long softwareWatchdogCounter = 0;
-bool criticalOperationInProgress = false;
-
-// Time synchronization
-bool timeInitialized = false;
-time_t now;
-const char* ntpServer1 = "pool.ntp.org";
-const long gmtOffset_sec = 0;
-const int daylightOffset_sec = 0;
-
-// ========== MEMORY MANAGEMENT ==========
-
-void checkMemoryHealth() {
-  uint32_t currentFree = ESP.getFreeHeap();
-  uint16_t fragmentation = 0; // ESP32 doesn't have getHeapFragmentation()
-  uint32_t maxFreeBlock = ESP.getMaxAllocHeap();
-  
-  // Track minimum heap
-  if (currentFree < minFreeHeap) {
-    minFreeHeap = currentFree;
-  }
-  
-  // Log memory status every 30 seconds
-  if (millis() - lastMemoryCheck > MEMORY_CHECK_INTERVAL) {
-    Serial.println(FPSTR(PROGMEM_MEMORY_CHECK));
-    Serial.println("Current free: " + String(currentFree) + " bytes");
-    Serial.println("Minimum free: " + String(minFreeHeap) + " bytes");
-    Serial.println("Fragmentation: " + String(fragmentation) + "%");
-    Serial.println("Max free block: " + String(maxFreeBlock) + " bytes");
-    
-    if (currentFree < 20000) {
-      Serial.println("⚠️ LOW MEMORY WARNING!");
-      forceMemoryCleanup(); // Cleanup much earlier
-    }
-    if (fragmentation > 30) {
-      Serial.println("⚠️ HIGH FRAGMENTATION WARNING!");
-      forceMemoryCleanup(); // Cleanup on high fragmentation
-    }
-    if (currentFree < 15000) {
-      Serial.println("🚨 CRITICAL MEMORY - FORCING AGGRESSIVE CLEANUP!");
-      
-      // Force aggressive cleanup
-      for (int i = 0; i < 10; i++) {
-        yield();
-        // ESP32 watchdog is handled automatically
-        delay(10);
-      }
-      
-      uint32_t afterCleanup = ESP.getFreeHeap();
-      Serial.println("💾 After cleanup: " + String(afterCleanup) + " bytes");
-      
-      // Emergency restart if cleanup failed
-      if (afterCleanup < 12000) {
-        Serial.println("🚨 EMERGENCY: Memory cleanup failed - RESTARTING!");
-        emergencyRestart("Critical memory after cleanup");
-      }
-    }
-    
-    // Force restart if memory gets dangerously low
-    if (currentFree < 8000) {
-      Serial.println("🚨 EMERGENCY: Memory dangerously low - FORCING RESTART!");
-      emergencyRestart("Dangerously low memory");
-    }
-    
-    lastMemoryCheck = millis();
-  }
+// ---------- Telegram ----------
+String mainKeyboard(Role r = R_USER) {
+  if (r == R_GUEST) return hasDisplay() ? "[[\"🚪 Open Intercom\", \"📺 View Display\"]]" : "[[\"🚪 Open Intercom\"]]";
+  return hasDisplay() ? "[[\"🚪 Open Intercom\", \"📺 View Display\"], [\"📊 Status\"]]"
+                      : "[[\"🚪 Open Intercom\"], [\"📊 Status\"]]";
 }
 
-// Force memory cleanup when needed
-void forceMemoryCleanup() {
-  Serial.println("🧹 Forcing aggressive memory cleanup...");
-  
-  uint32_t beforeCleanup = ESP.getFreeHeap();
-  
-  // More aggressive cleanup cycles
-  for (int i = 0; i < 20; i++) {
-    yield();
-    // ESP32 watchdog is handled automatically
-    delay(10);
-  }
-  
-  // Force garbage collection
-  delay(100);
-  
-  // Additional cleanup cycles
-  for (int i = 0; i < 10; i++) {
-    yield();
-    // ESP32 watchdog is handled automatically
-    delay(5);
-  }
-  
-  delay(200);  // Allow system cleanup
-  uint32_t afterCleanup = ESP.getFreeHeap();
-  
-  int recovered = afterCleanup - beforeCleanup;
-  // Разбиваем сложную конкатенацию
-  Serial.print("💾 Memory: "); 
-  Serial.print(beforeCleanup); 
-  Serial.print(" -> "); 
-  Serial.print(afterCleanup); 
-  Serial.print(" (+"); 
-  Serial.print(recovered); 
-  Serial.println(" bytes)");
-  
-  // If cleanup didn't help much, something is wrong
-  if (recovered < 100 && afterCleanup < 15000) {
-    Serial.println("⚠️ WARNING: Memory cleanup ineffective!");
-  }
+String btn(const String &text, const String &data) {
+  return "{\"text\":\"" + text + "\",\"callback_data\":\"" + data + "\"}";
 }
 
-// ========== ADVANCED WATCHDOG SYSTEM ==========
-
-void softwareWatchdogFeed() {
-  softwareWatchdogCounter++;
-  lastLoopTime = millis();
-  // ESP32 watchdog is handled automatically
-  
-  // Log every 1000 feeds (about every 100 seconds in normal operation)
-  if (softwareWatchdogCounter % 1000 == 0) {
-    Serial.println("🐕 Watchdog: " + String(softwareWatchdogCounter) + " feeds");
-  }
+// Replace the text of a message that carried inline buttons and drop the buttons
+void editMsg(telegramMessage &m, const String &text) {
+  bot.sendMessageWithInlineKeyboard(m.chat_id, text, "", "[]", m.message_id);
 }
 
-void beginCriticalOperation(const char* operationName) {
-  criticalOperationInProgress = true;
-  Serial.println("🔒 Beginning critical operation: " + String(operationName));
-  
-  // Pre-operation memory check
-  uint32_t freeMem = ESP.getFreeHeap();
-  if (freeMem < CRITICAL_MEMORY_THRESHOLD) {
-    Serial.println("🚨 CRITICAL: Starting operation with low memory!");
-    forceMemoryCleanup();
-  }
-  
-  softwareWatchdogFeed();
+void applyTelegram() {
+  bot.updateToken(cfg.token);
+  if (cfg.tlsVerify) tgClient.setCACert(TELEGRAM_CERTIFICATE_ROOT);
+  else tgClient.setInsecure();
+  tgOk = false; tgBotName = ""; tgCheckedOnce = false;
 }
 
-void endCriticalOperation(const char* operationName) {
-  criticalOperationInProgress = false;
-  Serial.println("✅ Completed critical operation: " + String(operationName));
-  
-  // Post-operation memory check
-  uint32_t freeMem = ESP.getFreeHeap();
-  Serial.println("💾 Memory after operation: " + String(freeMem) + " bytes");
-  
-  softwareWatchdogFeed();
-}
-
-void checkSystemHealth() {
-  unsigned long currentTime = millis();
-  
-  // Check for loop hang (more than 10 seconds without loop iteration)
-  if (currentTime - lastLoopTime > MAX_LOOP_TIME) {
-    Serial.println("🚨 SYSTEM HANG DETECTED - FORCING RESTART!");
-    Serial.println("Last loop was " + String((currentTime - lastLoopTime) / 1000) + " seconds ago");
-    
-    // Try to send emergency message before restart
-    if (telegramConnected) {
-      bot.sendMessage(CHAT_ID, "🚨 EMERGENCY: System hang detected, restarting...", "");
-      delay(1000); // Give time to send
-    }
-    
-    ESP.restart();
-  }
-  
-  // Check for memory leaks
-  uint32_t currentFree = ESP.getFreeHeap();
-  if (currentFree < CRITICAL_MEMORY_THRESHOLD) {
-    Serial.println("🚨 CRITICAL MEMORY LEAK DETECTED!");
-    Serial.println("Free memory: " + String(currentFree) + " bytes");
-    
-    // Emergency cleanup
-    forceMemoryCleanup();
-    
-    currentFree = ESP.getFreeHeap();
-    if (currentFree < CRITICAL_MEMORY_THRESHOLD) {
-      Serial.println("🚨 MEMORY CLEANUP FAILED - FORCING RESTART!");
-      
-      // Emergency restart
-      if (telegramConnected) {
-        bot.sendMessage(CHAT_ID, "🚨 EMERGENCY: Critical memory leak, restarting...", "");
-        delay(1000);
-      }
-      ESP.restart();
-    }
-  }
-  
-  // Check WiFi health
-  if (currentTime - lastWiFiCheck > 60000) { // Check every minute
-    if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("⚠️ WiFi disconnected - attempting reconnection");
-      WiFi.reconnect();
-    }
-    lastWiFiCheck = currentTime;
-  }
-  
-  // Check Telegram silence (no activity for too long)
-  if (telegramConnected && (currentTime - lastTelegramActivity > MAX_TELEGRAM_SILENCE)) {
-    Serial.println("⚠️ Telegram silent for too long - testing connection");
-    
-    // Test Telegram connection
-    if (!testTelegramConnectivity()) {
-      telegramConnected = false;
-      Serial.println("💬 Telegram connection lost");
-    }
-  }
-}
-
-void emergencyRestart(const char* reason) {
-  Serial.println("🚨 EMERGENCY RESTART: " + String(reason));
-  
-  // Try to save critical state
-  settings.lastUptime = millis() / 60000;
-  saveSettings();
-  
-  // Try to send emergency notification
-  if (telegramConnected) {
-    String emergencyMsg = "🚨 EMERGENCY RESTART\n\nReason: ";
-    emergencyMsg += reason;
-    emergencyMsg += "\nUptime: " + String(millis() / 60000) + " min";
-    emergencyMsg += "\nMemory: " + String(ESP.getFreeHeap()) + " bytes";
-    
-    bot.sendMessage(CHAT_ID, emergencyMsg, "");
-    delay(2000); // Give time to send
-  }
-  
-  ESP.restart();
-}
-
-// ========== AUTO PORT DETECTION ==========
-
-bool autoDetectTelegramPort() {
-  Serial.println("🔍 Auto-detecting working Telegram port...");
-  
-  // Test HTTPS ports in order of preference (Livebox 6 often blocks 443)
-  int testPorts[] = {443, 8443, 80};
-  int numPorts = sizeof(testPorts) / sizeof(testPorts[0]);
-  
-  for (int i = 0; i < numPorts; i++) {
-    Serial.print("Testing port " + String(testPorts[i]) + "... ");
-    
-    WiFiClientSecure testClient;
-    testClient.setInsecure();  // Required for Livebox 6 router compatibility
-    
-    unsigned long start = millis();
-    if (testClient.connect("api.telegram.org", testPorts[i])) {
-      unsigned long duration = millis() - start;
-      Serial.println("✅ Success in " + String(duration) + " ms");
-      
-      workingTelegramPort = testPorts[i];
-      testClient.stop();
-      
-      Serial.println("🎯 Using Telegram port: " + String(workingTelegramPort));
-      return true;
-    } else {
-      unsigned long duration = millis() - start;
-      Serial.println("❌ Failed after " + String(duration) + " ms");
-    }
-    
-    delay(1000);
-  }
-  
-  Serial.println("⚠️ All HTTPS ports failed - using default 443");
-  Serial.println("💡 Livebox 6 may be blocking SSL handshake");
-  Serial.println("💡 Try: Mobile hotspot, router reboot, or different network");
-  workingTelegramPort = 443;
-  return false;
-}
-
-// ========== TIME FUNCTIONS ==========
-
-bool initializeNTP() {
-  Serial.println("🕐 Initializing NTP time synchronization...");
-  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer1);
-  
-  // Wait for time sync
-  unsigned long start = millis();
-  while (millis() - start < 10000) {
-    time(&now);
-    if (now > 1000000000) {
-      timeInitialized = true;
-      Serial.println("✅ NTP synchronization successful");
-      return true;
-    }
-    delay(500);
-    // ESP32 watchdog is handled automatically
-  }
-  
-  Serial.println("❌ NTP synchronization failed");
-  return false;
-}
-
-bool isTimeValid() {
-  time(&now);
-  return (now > 1000000000 && timeInitialized);
-}
-
-// ========== TELEGRAM FUNCTIONS ==========
-
-bool testTelegramConnectivity() {
-  Serial.println("📡 Testing Telegram API connectivity...");
-  Serial.println("🔓 Using insecure SSL for Livebox 6 router compatibility...");
-  
-  // Check time first
-  if (!isTimeValid()) {
-    Serial.println("⚠️ System time invalid - attempting quick sync...");
-    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer1);
-    delay(2000);
-    time(&now);
-    if (now > 1000000000) {
-      timeInitialized = true;
-      Serial.println("✅ Time sync successful");
-    }
-  }
-  
-  // Use simple SSL approach with minimal Livebox 6 compatibility
-  WiFiClientSecure testClient;
-  testClient.setInsecure();  // Required for Livebox 6 router compatibility
-  
-  Serial.print("🔗 Connecting to api.telegram.org:" + String(workingTelegramPort) + "... ");
-  unsigned long connectStart = millis();
-  
-  if (testClient.connect("api.telegram.org", workingTelegramPort)) {
-    unsigned long connectTime = millis() - connectStart;
-    Serial.println("✅ Connected in " + String(connectTime) + " ms");
-    
-    // Test API call
-    testClient.print("GET /bot");
-    testClient.print(BOT_TOKEN);
-    testClient.println("/getMe HTTP/1.1");
-    testClient.println("Host: api.telegram.org");
-    testClient.println("Connection: close");
-    testClient.println();
-    
-    // Wait for response
-    unsigned long timeout = millis() + 10000;
-    while (testClient.available() == 0 && millis() < timeout) {
-      delay(100);
-      // ESP32 watchdog is handled automatically
-    }
-    
-    if (testClient.available()) {
-      String response = testClient.readStringUntil('\n');
-      testClient.stop();
-      
-      if (response.indexOf("200 OK") >= 0) {
-        Serial.println("✅ API test successful");
-        return true;
-      } else {
-        Serial.println("⚠️ Connected but API failed");
-      }
-    } else {
-      Serial.println("⚠️ Connected but no API response");
-      testClient.stop();
-    }
-  } else {
-    unsigned long connectTime = millis() - connectStart;
-    Serial.println("❌ Failed after " + String(connectTime) + " ms");
-  }
-  
-  return false;
-}
-
-bool reconnectTelegram() {
-  Serial.println("🔄 Attempting Telegram reconnection...");
-  telegramReconnectAttempts++;
-  
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("❌ WiFi not connected");
-    return false;
-  }
-  
-  if (!testTelegramConnectivity()) {
-    Serial.println("❌ Reconnection failed (attempt " + String(telegramReconnectAttempts) + ")");
-    return false;
-  }
-  
-  // Send test message
-  String testMsg = "🔄 Telegram reconnected!\nAttempt: " + String(telegramReconnectAttempts);
-  testMsg += "\nUptime: " + String(millis() / 60000) + " min";
-  
-  bool sent = bot.sendMessage(CHAT_ID, testMsg, "");
-  if (sent) {
-    Serial.println("✅ Reconnected successfully (attempt " + String(telegramReconnectAttempts) + ")");
-    telegramConnected = true;
-    lastSuccessfulMessage = millis();
+// Call notification with an "Open" button right in the message
+void notifyCall(const String &msg) {
+  String ts = String(nowEpoch());
+  String kb = "[[" + btn("🚪 Открыть", "c:" + ts);
+  if (hasDisplay()) kb += "," + btn("📺 Экран", "v:" + ts);
+  kb += "]]";
+  if (cfg.admin.length()) bot.sendMessageWithInlineKeyboard(cfg.admin, msg, "", kb);
+  if (cfg.notifyAll) forEachUser(cfg.users, [&](const String &id, const String &) {
+    if (id != cfg.admin) { esp_task_wdt_reset(); bot.sendMessageWithInlineKeyboard(id, msg, "", kb); }
     return true;
-  } else {
-    Serial.println("❌ Test message failed (attempt " + String(telegramReconnectAttempts) + ")");
-    return false;
-  }
+  });
 }
 
-// ========== HARDWARE FUNCTIONS ==========
-
-void pressCameraButton() {
-  Serial.println("🎥 === CAMERA BUTTON PRESS ===");
-  Serial.println("Changing camera pin " + String(cameraButtonPin) + " to HIGH");
-  
-  digitalWrite(cameraButtonPin, HIGH);
-  delay(settings.cameraActivationTime);
-  digitalWrite(cameraButtonPin, LOW);
-  
-  Serial.println("Changing camera pin " + String(cameraButtonPin) + " to LOW");
-  Serial.println("🎥 === CAMERA BUTTON RELEASE ===");
+void notifyAdmin(const String &id, const String &msg) {
+  if (cfg.admin.length() && id != cfg.admin) bot.sendMessage(cfg.admin, msg, "");
 }
 
-void viewDisplayOnly() {
-  if (!hasDisplay()) { Serial.println("ℹ️ Simple intercom: no display, ignoring"); return; }
-  beginCriticalOperation("View Display Only");
-  suppressCallDetection = true;
-  pressCameraButton();
-  endCriticalOperation("View Display Only");
-  suppressCallDetection = false;
-  // Ignore incoming call detection for 32 seconds after turning display on
-  ignoreCallUntil = millis() + 32000UL;
+String statusText() {
+  String s = "📊 Статус\n";
+  s += "Тип: " + String(hasDisplay() ? "с экраном" : "простой (без экрана)") + "\n";
+  s += "WiFi: " + WiFi.SSID() + " (" + String(WiFi.RSSI()) + " dBm)\n";
+  s += "Адрес: http://" + cfg.host + ".local  (" + WiFi.localIP().toString() + ")\n";
+  s += "Работает: " + fmtUptime(millis() / 1000) + "\n";
+  s += "Прошивка: " FW_VERSION " / " BOARD_NAME;
+  return s;
 }
 
-void pressDoorButton() {
-  Serial.println("🚪 === DOOR BUTTON PRESS ===");
-  Serial.println("Changing door pin " + String(doorButtonPin) + " to HIGH");
-  
-  digitalWrite(doorButtonPin, HIGH);
-  delay(settings.doorActivationTime);
-  digitalWrite(doorButtonPin, LOW);
-  
-  Serial.println("Changing door pin " + String(doorButtonPin) + " to LOW");
-  Serial.println("🚪 === DOOR BUTTON RELEASE ===");
+// Person who is not on any list wrote to the bot: tell them their id and ask the admin
+void handleStranger(telegramMessage &m) {
+  String id = m.chat_id;
+  addLog("⛔ Отказ: " + m.from_name + " (" + id + ")");
+  if (millis() - lastUnauthReply < 10000) return;          // simple anti-spam
+  lastUnauthReply = millis();
+  bool ask = cfg.admin.length() && (id != lastReqId || millis() - lastReqMs > 600000);
+  bot.sendMessage(id, "❌ Нет доступа.\nВаш chat_id: " + id +
+                  (ask ? "\nЗапрос отправлен администратору." : "\nПопросите администратора добавить его."), "");
+  if (!ask) return;
+  lastReqId = id; lastReqMs = millis();
+  String name = cleanName(m.from_name, 40);
+  String kb = "[[" + btn("🕐 Гость на " + String(REQ_GUEST_H) + " ч", "g:" + id + ":" + name) + "," +
+              btn("✅ Добавить", "u:" + id + ":" + name) + "]]";
+  bot.sendMessageWithInlineKeyboard(cfg.admin, "🙋 " + (name.length() ? name : String("Кто-то")) +
+                                    " (" + id + ") просит доступ к домофону", "", kb);
 }
 
-void openIntercom() {
-  beginCriticalOperation("Intercom Opening");
-  suppressCallDetection = true; // Ignore call detection while opening
-  // Simple intercom (no screen): never touch the camera/display output
-  bool displayCurrentlyOn = !hasDisplay() || (digitalRead(cameraButtonPin) == HIGH) || (millis() < ignoreCallUntil);
-  bool pressedCameraThisCycle = false;
-  
-  // Check memory before each critical step
-  uint32_t freeMem = ESP.getFreeHeap();
-  if (freeMem < CRITICAL_MEMORY_THRESHOLD) {
-    Serial.println("🚨 CRITICAL MEMORY - Aborting intercom operation!");
-    endCriticalOperation("Intercom Opening - ABORTED");
-    suppressCallDetection = false;
+bool doOpen(const String &id, const String &who, Role r) {
+  if (!openDoor()) return false;
+  addLog("🚪 Открыто: " + who);
+  if (r == R_GUEST) notifyAdmin(id, "🚪 Дверь открыл " + who);
+  return true;
+}
+
+// Inline buttons: c:<ts> open from a call, v:<ts> screen from a call, o:<ts> confirmed open,
+// x cancel, g:<id>:<name> guest access, u:<id>:<name> permanent access
+void handleCallback(telegramMessage &m) {
+  String id = m.chat_id, d = m.text;
+  Role r = roleOf(id);
+  if (r == R_NONE) { bot.answerCallbackQuery(m.query_id, "Нет доступа"); return; }
+  String who = userLabel(id, m.from_name);
+  int c1 = d.indexOf(':');
+  String kind = c1 < 0 ? d : d.substring(0, c1), arg = c1 < 0 ? "" : d.substring(c1 + 1);
+
+  if (kind == "x") { bot.answerCallbackQuery(m.query_id, "Отменено"); editMsg(m, "Отменено"); return; }
+
+  if (kind == "c" || kind == "v" || kind == "o") {
+    long ts = arg.toInt(), win = kind == "o" ? CONFIRM_BTN_S : CALL_BTN_S;
+    String head = kind == "o" ? "" : m.reply_to_text + "\n\n";
+    if (ts > 0 && nowEpoch() && nowEpoch() - ts > win) {
+      bot.answerCallbackQuery(m.query_id, "Кнопка устарела");
+      editMsg(m, head + "⏱ Кнопка устарела, дверь не открыта");
+      return;
+    }
+    if (kind == "v") {
+      bool ok = viewDisplay();
+      bot.answerCallbackQuery(m.query_id, ok ? "Экран включён" : "Занято");
+      if (ok) addLog("📺 Экран: " + who);
+      return;                                    // keep the "Open" button for later
+    }
+    bool ok = doOpen(id, who, r);
+    bot.answerCallbackQuery(m.query_id, ok ? "Дверь открыта" : "Занято, попробуйте ещё раз");
+    if (ok) editMsg(m, head + "✅ Открыто: " + who);
     return;
   }
-  
-  // If display is already on (or recently turned on), skip camera press to avoid toggling it off
-  if (!displayCurrentlyOn) {
-    pressCameraButton();
-    pressedCameraThisCycle = true;
-    // When we turn on the display here, ignore incoming call detection for 32s
-    unsigned long newIgnoreUntil = millis() + 32000UL;
-    if (newIgnoreUntil > ignoreCallUntil) {
-      ignoreCallUntil = newIgnoreUntil;
-    }
-  }
-  
-  // Safe delay with watchdog feeding and memory check
-  softwareWatchdogFeed();
-  yield();
-  
-  // Check memory again before second operation
-  freeMem = ESP.getFreeHeap();
-  if (freeMem < CRITICAL_MEMORY_THRESHOLD) {
-    Serial.println("🚨 CRITICAL MEMORY after camera - Aborting door operation!");
-    endCriticalOperation("Intercom Opening - PARTIAL");
-    suppressCallDetection = false;
-    return;
-  }
-  
-  if (hasDisplay()) delay(500);
-  pressDoorButton();
-  
-  endCriticalOperation("Intercom Opening");
-  // Set/extend ignore window before lifting suppression to avoid race
-  if (pressedCameraThisCycle) {
-    // Already set to 32s above; keep it as-is
-  } else {
-    // If we didn't press camera now, still add a small tail to avoid relay noise
-    unsigned long tail = millis() + 2000UL;
-    if (tail > ignoreCallUntil) {
-      ignoreCallUntil = tail;
-    }
-  }
-  suppressCallDetection = false; // Re-enable call detection after ignore window is set
-}
 
-void checkIncomingCall() {
-  if (!hasDisplay()) return; // Simple intercom has no call detection input
-  unsigned long nowTs = millis();
-  if (suppressCallDetection || (nowTs < ignoreCallUntil)) {
-    // Skip call detection while door/camera operation is in progress
-    lastCallState = false;
-    return;
-  }
-  int analogValue = analogRead(callIndicatorPin);
-  bool currentCallState = (analogValue < settings.callThreshold);
-  
-  // Debug every 2 minutes (reduce spam)
-  static unsigned long lastDebugTime = 0;
-  if (millis() - lastDebugTime > 120000) {
-    Serial.print("A0: "); 
-    Serial.print(analogValue); 
-    Serial.print("/"); 
-    Serial.print(settings.callThreshold); 
-    Serial.print(", Mem: "); 
-    Serial.print(ESP.getFreeHeap()); 
-    Serial.println("b");
-    lastDebugTime = millis();
-  }
-  
-  if (currentCallState && !lastCallState && 
-      (nowTs - lastCallTime > settings.callDebounceTime) &&
-      (nowTs >= ignoreCallUntil)) {
-    
-      callDetected = true;
-      lastCallTime = millis();
-      
-    Serial.println("📞 === INCOMING CALL DETECTED ===");
-    Serial.println("Analog value: " + String(analogValue));
-    
-    // Send notification
-    String callMsg = "📞 INCOMING CALL!\n\nAnalog value: " + String(analogValue);
-    callMsg += "\nThreshold: " + String(settings.callThreshold);
-    callMsg += "\nTime: " + String(millis() / 60000) + " min uptime";
-    
-    bot.sendMessage(CHAT_ID, callMsg, "");
-    Serial.println("📤 Call notification sent");
-  }
-  
-  lastCallState = currentCallState;
-}
-
-// ========== TELEGRAM MESSAGE HANDLING ==========
-
-void handleNewMessages(int numNewMessages) {
-  // ESP32 watchdog is handled automatically
-  Serial.println("📨 Handling " + String(numNewMessages) + " new messages");
-
-  for (int i = 0; i < numNewMessages; i++) {
-    // ESP32 watchdog is handled automatically
-    
-    String chat_id = String(bot.messages[i].chat_id);
-    String text = bot.messages[i].text;
-    String from_name = bot.messages[i].from_name;
-
-    Serial.println("📩 Message from " + from_name + " (" + chat_id + "): " + text);
-
-    if (!isAuthorized(chat_id)) {
-      String unauthMsg = "❌ Unauthorized access\n\n";
-      unauthMsg += "Your chat_id: ";
-      unauthMsg += chat_id;
-      unauthMsg += "\nAsk admin to add it to whitelist.";
-      bot.sendMessage(chat_id, unauthMsg, "");
-      Serial.println("⚠️ Unauthorized user blocked, chat_id=" + chat_id);
-      continue;
-    }
-
-    if (text == "/start") {
-      String welcome = "🏠 *Telegram Intercom System*\n\n";
-      welcome += "Welcome! Use the button below to open the intercom:\n\n";
-      if (hasDisplay()) {
-        welcome += "🎥 Camera will activate for " + String(settings.cameraActivationTime) + "ms\n";
-        welcome += "🚪 Door will unlock for " + String(settings.doorActivationTime) + "ms\n";
-        welcome += "📞 Call detection threshold: " + String(settings.callThreshold) + "\n\n";
-      } else {
-        welcome += "🚪 Door will unlock for " + String(settings.doorActivationTime) + "ms\n\n";
-      }
-      welcome += "📋 *Available Commands:*\n";
-      welcome += "/start - Show this menu\n";
-      welcome += "/status - System status\n";
-      if (chat_id == CHAT_ID) {
-        welcome += "\n*Admin commands:*\n";
-        welcome += "/allow <chat_id> - Add user\n";
-        welcome += "/deny <chat_id> - Remove user\n";
-        welcome += "/list - List authorized\n";
-      }
-
-      String replyKeyboard = mainKeyboard(true);
-      bot.sendMessageWithReplyKeyboard(chat_id, welcome, "", replyKeyboard, true, false, false);
-      
-    } else if (text == "🚪 Open Intercom") {
-      Serial.println("🚪 Remote open command received");
-      
-      bot.sendMessage(chat_id, hasDisplay() ? "🎥 Activating camera and opening door..." : "🚪 Opening door...", "");
-      openIntercom();
-      
-      String confirmMsg = "✅ *Intercom Opened Successfully*\n\n";
-      if (hasDisplay()) confirmMsg += "🎥 Camera activated for " + String(settings.cameraActivationTime) + "ms\n";
-      confirmMsg += "🚪 Door unlocked for " + String(settings.doorActivationTime) + "ms\n";
-      confirmMsg += "⏰ Time: " + String(millis() / 60000) + " min uptime";
-      
-      bot.sendMessage(chat_id, confirmMsg, "Markdown");
-      
-    } else if (text == "📺 View Display" && hasDisplay()) {
-      Serial.println("📺 View Display command received");
-      bot.sendMessage(chat_id, "🎥 Turning on display...", "");
-      viewDisplayOnly();
-      bot.sendMessage(chat_id, "✅ Display turned on", "");
-    } else if (text.startsWith("/allow")) {
-      if (chat_id != CHAT_ID) { bot.sendMessage(chat_id, "❌ Admin only", ""); continue; }
-      String parts = text; parts.replace("/allow",""); parts.trim();
-      if (parts.length() == 0) { bot.sendMessage(chat_id, "Usage: /allow <chat_id>", ""); continue; }
-      bool ok = addAuthorizedChatId(parts);
-      bot.sendMessage(chat_id, ok ? ("✅ Added: " + parts) : "❌ Failed to add (no space?)", "");
-    } else if (text.startsWith("/deny")) {
-      if (chat_id != CHAT_ID) { bot.sendMessage(chat_id, "❌ Admin only", ""); continue; }
-      String parts = text; parts.replace("/deny",""); parts.trim();
-      if (parts.length() == 0) { bot.sendMessage(chat_id, "Usage: /deny <chat_id>", ""); continue; }
-      bool ok = removeAuthorizedChatId(parts);
-      bot.sendMessage(chat_id, ok ? ("✅ Removed: " + parts) : "❌ Failed to remove", "");
-    } else if (text == "/list") {
-      if (chat_id != CHAT_ID) { bot.sendMessage(chat_id, "❌ Admin only", ""); continue; }
-      String list = String(settings.authorizedChats);
-      if (list.length() == 0) list = "<empty>";
-      bot.sendMessage(chat_id, "👥 Authorized: " + list, "");
-      
-    } else if (text == "/status" || text == "📊 Status") {
-      Serial.println("📊 Status command received - OPTIMIZED VERSION");
-      
-      // Проверяем память перед созданием большого сообщения
-      uint32_t memBefore = ESP.getFreeHeap();
-      if (memBefore < 20000) {
-        bot.sendMessage(chat_id, "⚠️ Low memory, sending short status:\n💾 Memory: " + String(memBefore) + " bytes\n📊 IP: " + WiFi.localIP().toString(), "");
-        return;
-      }
-      
-      // Создаем статус по частям для экономии памяти
-      String statusMsg = "📊 *System Status*\n\n";
-      
-      // WiFi Status
-      statusMsg += "📡 *WiFi:* ";
-      statusMsg += (WiFi.status() == WL_CONNECTED) ? "✅ Connected\n" : "❌ Disconnected\n";
-      if (WiFi.status() == WL_CONNECTED) {
-        statusMsg += "🌐 *SSID:* ";
-        statusMsg += WiFi.SSID();
-        statusMsg += "\n📍 *IP:* ";
-        statusMsg += WiFi.localIP().toString();
-        statusMsg += "\n";
-      }
-      
-      // Отправляем первую часть и очищаем строку
-      bot.sendMessage(chat_id, statusMsg, "Markdown");
-      statusMsg = ""; // Освобождаем память
-      
-      // Telegram Status  
-      statusMsg = "💬 *Telegram:* ";
-      statusMsg += telegramConnected ? "✅ Connected" : "❌ Disconnected";
-      statusMsg += "\n💾 *Memory:* ";
-      statusMsg += String(ESP.getFreeHeap());
-      statusMsg += " bytes\n⏰ *Uptime:* ";
-      statusMsg += String(millis() / 60000);
-      statusMsg += " min";
-      
-      String replyKeyboard = mainKeyboard(true);
-      bot.sendMessageWithReplyKeyboard(chat_id, statusMsg, "Markdown", replyKeyboard, true, false, false);
-      
+  if (kind == "g" || kind == "u") {
+    if (r != R_ADMIN) { bot.answerCallbackQuery(m.query_id, "Только для администратора"); return; }
+    int c2 = arg.indexOf(':');
+    String uid = c2 < 0 ? arg : arg.substring(0, c2), name = c2 < 0 ? "" : arg.substring(c2 + 1);
+    if (!validChatId(uid)) { bot.answerCallbackQuery(m.query_id, "Неверный chat_id"); return; }
+    String res;
+    if (kind == "g") {
+      if (!addGuest(uid, REQ_GUEST_H, name)) { bot.answerCallbackQuery(m.query_id, "Время не синхронизировано"); return; }
+      res = "🕐 Гость до " + fmtUntil(guestExpiry(uid)) + ": " + userLabel(uid, name);
+      bot.sendMessageWithReplyKeyboard(uid, "✅ Вам открыт доступ к домофону до " + fmtUntil(guestExpiry(uid)), "", mainKeyboard(R_GUEST), true);
     } else {
-      bot.sendMessage(chat_id, "❓ Unknown command. Use /start to see available options.", "");
+      if (!isListedUser(uid)) {
+        String errs; cfg.users = normalizeUsers(cfg.users + uid + (name.length() ? " " + name : "") + "\n", errs);
+        prefs.putString("users", cfg.users);
+      }
+      rebuildGuests(uid);
+      res = "✅ Добавлен: " + userLabel(uid);
+      bot.sendMessageWithReplyKeyboard(uid, "✅ Вам открыт доступ к домофону", "", mainKeyboard(R_USER), true);
     }
+    addLog(res);
+    bot.answerCallbackQuery(m.query_id, "Готово");
+    editMsg(m, m.reply_to_text + "\n\n" + res);
+    return;
+  }
+  bot.answerCallbackQuery(m.query_id, "");
+}
+
+void handleMessage(telegramMessage &m) {
+  if (m.type == "callback_query") { handleCallback(m); return; }
+  String id = m.chat_id, text = m.text; text.trim();
+  Role r = roleOf(id);
+  if (r == R_NONE) { handleStranger(m); return; }
+
+  bool isOpen = text == "🚪 Open Intercom" || text == "/open";
+  bool isView = text == "📺 View Display" || text == "/display";
+  String who = userLabel(id, m.from_name);
+
+  // Drop commands that were delivered late (e.g. sent while the device was offline)
+  long sent = m.date.toInt();
+  long age = nowEpoch() && sent > 0 ? nowEpoch() - sent : 0;
+  if ((isOpen || isView) && age > (long)cfg.maxAgeS) {
+    addLog("⏱ Устаревшая команда (" + String(age) + " с) от " + who);
+    bot.sendMessage(id, "⏱ Команда пришла с опозданием " + String(age) + " с и не выполнена. Нажмите ещё раз.", "");
+    return;
+  }
+
+  bool isAdmin = r == R_ADMIN;
+
+  if (isOpen) {
+    if (cfg.confirmOpen) {
+      String kb = "[[" + btn("✅ Да, открыть", "o:" + String(nowEpoch())) + "," + btn("Отмена", "x") + "]]";
+      bot.sendMessageWithInlineKeyboard(id, "Открыть дверь?", "", kb);
+    } else if (doOpen(id, who, r)) bot.sendMessage(id, "✅ Дверь открыта", "");
+    else bot.sendMessage(id, "⏳ Занято, попробуйте ещё раз", "");
+  } else if (isView) {
+    if (!hasDisplay()) bot.sendMessage(id, "У этого домофона нет экрана", "");
+    else if (viewDisplay()) { addLog("📺 Экран: " + who); bot.sendMessage(id, "✅ Экран включён", ""); }
+    else bot.sendMessage(id, "⏳ Занято, попробуйте ещё раз", "");
+  } else if (text == "/id") {
+    bot.sendMessage(id, "Ваш chat_id: " + id, "");
+  } else if (r == R_GUEST) {
+    bot.sendMessageWithReplyKeyboard(id, "🏠 Домофон\nГостевой доступ до " + fmtUntil(guestExpiry(id)) +
+                                     "\nКнопка внизу открывает дверь.", "", mainKeyboard(R_GUEST), true);
+  } else if (text == "📊 Status" || text == "/status") {
+    bot.sendMessageWithReplyKeyboard(id, statusText(), "", mainKeyboard(), true);
+  } else if (text.startsWith("/allow")) {
+    if (!isAdmin) { bot.sendMessage(id, "❌ Только для администратора", ""); return; }
+    String arg = text.substring(6); arg.trim();
+    int sp = arg.indexOf(' ');
+    String uid = sp < 0 ? arg : arg.substring(0, sp);
+    String name = sp < 0 ? "" : arg.substring(sp + 1); name.trim();
+    if (!validChatId(uid)) { bot.sendMessage(id, "Использование: /allow <chat_id> [имя]", ""); return; }
+    if (isListedUser(uid)) { bot.sendMessage(id, "Уже есть в списке: " + uid, ""); return; }
+    String errs; cfg.users = normalizeUsers(cfg.users + uid + (name.length() ? " " + name : "") + "\n", errs);
+    prefs.putString("users", cfg.users);
+    rebuildGuests(uid);
+    addLog("➕ Добавлен " + userLabel(uid));
+    bot.sendMessage(id, "✅ Добавлен: " + userLabel(uid), "");
+  } else if (text.startsWith("/deny")) {
+    if (!isAdmin) { bot.sendMessage(id, "❌ Только для администратора", ""); return; }
+    String uid = text.substring(5); uid.trim();
+    bool wasGuest = guestExpiry(uid) > 0;
+    if (!isListedUser(uid) && !wasGuest) { bot.sendMessage(id, "Нет в списке: " + uid, ""); return; }
+    String label = userLabel(uid), rebuilt;
+    forEachUser(cfg.users, [&](const String &u, const String &n) {
+      if (u != uid) rebuilt += u + (n.length() ? " " + n : "") + "\n"; return true; });
+    cfg.users = rebuilt; prefs.putString("users", cfg.users);
+    rebuildGuests(uid);
+    addLog("➖ Удалён " + label);
+    bot.sendMessage(id, "✅ Удалён: " + label, "");
+  } else if (text.startsWith("/guest")) {
+    if (!isAdmin) { bot.sendMessage(id, "❌ Только для администратора", ""); return; }
+    String arg = text.substring(6); arg.trim();
+    int sp = arg.indexOf(' ');
+    String uid = sp < 0 ? arg : arg.substring(0, sp), rest = sp < 0 ? "" : arg.substring(sp + 1);
+    rest.trim();
+    int hours = REQ_GUEST_H; String name = rest;
+    if (rest.length() && isdigit((unsigned char)rest[0])) {
+      int sp2 = rest.indexOf(' ');
+      hours = (sp2 < 0 ? rest : rest.substring(0, sp2)).toInt();
+      name = sp2 < 0 ? "" : rest.substring(sp2 + 1);
+    }
+    if (!validChatId(uid) || hours < 1) { bot.sendMessage(id, "Использование: /guest <chat_id> [часов] [имя]\nНапример: /guest 123456789 48 Курьер", ""); return; }
+    if (!addGuest(uid, hours, name)) { bot.sendMessage(id, "⚠️ Время не синхронизировано, попробуйте позже", ""); return; }
+    String res = "🕐 Гость до " + fmtUntil(guestExpiry(uid)) + ": " + userLabel(uid);
+    addLog(res);
+    bot.sendMessage(id, res, "");
+  } else if (text == "/list") {
+    if (!isAdmin) { bot.sendMessage(id, "❌ Только для администратора", ""); return; }
+    rebuildGuests("");
+    String list = "👥 Админ: " + cfg.admin + "\nПользователи:\n"; int count = 0;
+    forEachUser(cfg.users, [&](const String &u, const String &n) { list += "• " + u + (n.length() ? " — " + n : "") + "\n"; count++; return true; });
+    if (!count) list += "(пусто)\n";
+    String gl;
+    forEachGuest([&](const String &g, long e, const String &n) { gl += "• " + g + (n.length() ? " — " + n : "") + " до " + fmtUntil(e) + "\n"; return true; });
+    if (gl.length()) list += "Гости:\n" + gl;
+    bot.sendMessage(id, list, "");
+  } else {   // /start and anything else
+    String w = "🏠 Домофон\n\nКнопки внизу: открыть дверь" + String(hasDisplay() ? ", включить экран" : "") + ", статус.\n";
+    w += "Команды: /open /status /id";
+    if (hasDisplay()) w += " /display";
+    if (isAdmin) w += "\nАдмин: /allow <chat_id> [имя], /deny <chat_id>, /guest <chat_id> [часов] [имя], /list";
+    bot.sendMessageWithReplyKeyboard(id, w, "", mainKeyboard(), true);
   }
 }
 
-// ========== EEPROM FUNCTIONS ==========
+void pollTelegram() {
+  if (!cfg.token.length() || WiFi.status() != WL_CONNECTED) return;
 
-void saveSettings() {
-  EEPROM.put(0, settings);
-  EEPROM.commit();
-  Serial.println("⚙️ Settings saved to EEPROM");
-}
+  if (!tgCheckedOnce || millis() - lastTgCheck > TG_CHECK_MS) {
+    tgCheckedOnce = true; lastTgCheck = millis();
+    bool was = tgOk;
+    tgOk = bot.getMe();
+    if (tgOk) tgBotName = bot.userName;
+    if (tgOk != was) addLog(tgOk ? "💬 Telegram подключён (@" + tgBotName + ")" : "⚠️ Telegram недоступен");
+  }
+  if (millis() - lastPoll < TG_POLL_MS) return;
+  lastPoll = millis();
 
-void loadSettings() {
-  EEPROM.get(0, settings);
-  
-  // Validate settings and load defaults if invalid
-  if (settings.cameraActivationTime < 100 || settings.cameraActivationTime > 10000 || 
-      settings.callThreshold < 0 || settings.callThreshold > 1023 ||
-      settings.callDebounceTime < 1000 || settings.callDebounceTime > 60000 ||
-      settings.watchdogTimeout < 1 || settings.watchdogTimeout > 60) {
-    
-    // Load default settings
-    settings.cameraActivationTime = 2000;
-    settings.callThreshold = 15;
-    settings.callDebounceTime = 5000;
-    settings.doorActivationTime = 500;
-    strncpy(settings.botToken, BOT_TOKEN, sizeof(settings.botToken) - 1);
-    strncpy(settings.chatId, CHAT_ID, sizeof(settings.chatId) - 1);
-    settings.authorizedChats[0] = '\0';
-    settings.rebootCount = 1;
-    settings.lastUptime = 0;
-    settings.watchdogTimeout = 8;
-    settings.intercomType = INTERCOM_FULL;
-    
-    Serial.println("⚙️ Loading default settings");
-    saveSettings();
-  } else {
-    // Older firmware did not store the type: unknown value -> full intercom
-    if (settings.intercomType > INTERCOM_SIMPLE) settings.intercomType = INTERCOM_FULL;
-    settings.rebootCount++;
-    settings.lastUptime = millis() / 60000;
-    // sanitize CSV
-    bool ok = true;
-    for (size_t i = 0; i < sizeof(settings.authorizedChats) && settings.authorizedChats[i]; ++i) {
-      char c = settings.authorizedChats[i];
-      if (!(c == ',' || c == ' ' || (c >= '0' && c <= '9') || c == '+' || c == '-')) { ok = false; break; }
-    }
-    if (!ok) settings.authorizedChats[0] = '\0';
-    saveSettings();
+  for (int round = 0; round < 3; round++) {
+    esp_task_wdt_reset();
+    int n = bot.getUpdates(bot.last_message_received + 1);
+    if (n <= 0) break;
+    tgOk = true;
+    for (int i = 0; i < n; i++) { esp_task_wdt_reset(); handleMessage(bot.messages[i]); }
   }
 }
 
-// ========== WEB SERVER ==========
+// ---------- Call detection (full type) ----------
+void checkCall() {
+  if (!hasDisplay() || busy || windowActive(ignoreStart, ignoreLen)) { lastCallState = false; return; }
+  int v = analogRead(PIN_CALL);
+  bool active = v < cfg.threshold;
+  if (active && !lastCallState && millis() - lastCallMs > cfg.debounceMs) {
+    lastCallMs = millis();
+    addLog("📞 Звонок (A=" + String(v) + ")");
+    if (mqtt.connected()) mqtt.publish((mqttBase() + "/call").c_str(), "ON");
+    notifyCall("📞 Звонок в домофон!");
+  }
+  lastCallState = active;
+}
+
+// ---------- MQTT / Home Assistant ----------
+String devUid() { String m = WiFi.macAddress(); m.replace(":", ""); m.toLowerCase(); return "intercom_" + m; }
+
+void mqttDiscovery() {
+  String b = mqttBase(), u = devUid();
+  String dev = ",\"avty_t\":\"" + b + "/status\",\"dev\":{\"ids\":[\"" + u + "\"],\"name\":\"Домофон " + cfg.host +
+               "\",\"mf\":\"DIY\",\"mdl\":\"" BOARD_NAME "\",\"sw\":\"" FW_VERSION "\",\"cu\":\"http://" + cfg.host + ".local\"}}";
+  mqtt.publish(("homeassistant/button/" + u + "/open/config").c_str(),
+    ("{\"name\":\"Открыть дверь\",\"uniq_id\":\"" + u + "_open\",\"cmd_t\":\"" + b + "/cmd\",\"pl_prs\":\"open\",\"ic\":\"mdi:door-open\"" + dev).c_str(), true);
+  mqtt.publish(("homeassistant/sensor/" + u + "/event/config").c_str(),
+    ("{\"name\":\"Последнее событие\",\"uniq_id\":\"" + u + "_event\",\"stat_t\":\"" + b + "/event\",\"ic\":\"mdi:history\"" + dev).c_str(), true);
+  String dispTopic = "homeassistant/button/" + u + "/display/config", callTopic = "homeassistant/binary_sensor/" + u + "/call/config";
+  if (hasDisplay()) {
+    mqtt.publish(dispTopic.c_str(),
+      ("{\"name\":\"Включить экран\",\"uniq_id\":\"" + u + "_display\",\"cmd_t\":\"" + b + "/cmd\",\"pl_prs\":\"display\",\"ic\":\"mdi:monitor\"" + dev).c_str(), true);
+    mqtt.publish(callTopic.c_str(),
+      ("{\"name\":\"Звонок\",\"uniq_id\":\"" + u + "_call\",\"stat_t\":\"" + b + "/call\",\"off_dly\":30,\"ic\":\"mdi:bell-ring\"" + dev).c_str(), true);
+  } else {                                   // simple intercom: remove these entities
+    mqtt.publish(dispTopic.c_str(), "", true);
+    mqtt.publish(callTopic.c_str(), "", true);
+  }
+}
+
+void onMqtt(char *topic, byte *payload, unsigned int len) {
+  String cmd; for (unsigned i = 0; i < len; i++) cmd += (char)payload[i];
+  cmd.trim();
+  if (cmd == "open") { if (openDoor()) addLog("🚪 Открыто через Home Assistant"); }
+  else if (cmd == "display") { if (viewDisplay()) addLog("📺 Экран через Home Assistant"); }
+}
+
+void mqttRestart() { mqtt.disconnect(); mqttWasUp = false; lastMqttTry = millis() - MQTT_RETRY_MS; }
+
+void mqttLoop() {
+  if (!cfg.mqttOn || !cfg.mqttHost.length() || WiFi.status() != WL_CONNECTED) {
+    if (mqtt.connected()) mqtt.disconnect();
+    return;
+  }
+  if (mqtt.connected()) { mqtt.loop(); return; }
+  if (mqttWasUp) { mqttWasUp = false; addLog("⚠️ MQTT отключён"); }
+  if (millis() - lastMqttTry < MQTT_RETRY_MS) return;
+  lastMqttTry = millis();
+  esp_task_wdt_reset();
+  mqtt.setServer(cfg.mqttHost.c_str(), cfg.mqttPort);
+  String b = mqttBase();
+  bool ok = mqtt.connect(devUid().c_str(),
+                         cfg.mqttUser.length() ? cfg.mqttUser.c_str() : nullptr,
+                         cfg.mqttUser.length() ? cfg.mqttPass.c_str() : nullptr,
+                         (b + "/status").c_str(), 0, true, "offline");
+  esp_task_wdt_reset();
+  if (!ok) return;
+  mqttWasUp = true;
+  mqtt.publish((b + "/status").c_str(), "online", true);
+  mqtt.subscribe((b + "/cmd").c_str());
+  mqttDiscovery();
+  addLog("🏠 MQTT подключён (" + cfg.mqttHost + ")");
+}
+
+String mqttStatus() {
+  if (!cfg.mqttOn) return "<span class='mut'>выключено</span>";
+  if (mqtt.connected()) return "<span class='ok'>подключено</span> · " + esc(cfg.mqttHost);
+  return "<span class='err'>нет связи</span> · " + esc(cfg.mqttHost) + " (код " + String(mqtt.state()) + ")";
+}
+
+// ---------- Web portal ----------
+const char CSS[] PROGMEM = R"CSS(
+:root{--bg:#f4f5f7;--card:#fff;--fg:#1d2330;--mut:#6b7280;--acc:#2563eb;--bad:#dc2626;--ok:#15803d;--bd:#e3e6eb}
+@media(prefers-color-scheme:dark){:root{--bg:#111318;--card:#1b1e25;--fg:#e8eaf0;--mut:#9aa3b2;--acc:#3b82f6;--bad:#f87171;--ok:#4ade80;--bd:#2c313b}}
+*{box-sizing:border-box}body{margin:0;font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--fg)}
+nav{display:flex;gap:4px;flex-wrap:wrap;padding:10px 16px;background:var(--card);border-bottom:1px solid var(--bd)}
+nav a{color:var(--fg);text-decoration:none;padding:6px 12px;border-radius:8px}nav a.on{background:var(--acc);color:#fff}
+main{max-width:760px;margin:0 auto;padding:16px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:16px;margin:0 0 16px}
+h2{font-size:16px;margin:0 0 8px}label{display:block;margin:14px 0 4px;font-weight:600}
+small,.mut{color:var(--mut)}small{display:block;margin-top:4px}
+input,select,textarea{width:100%;padding:9px 10px;border:1px solid var(--bd);border-radius:8px;background:var(--bg);color:var(--fg);font:inherit}
+textarea{min-height:130px;font-family:ui-monospace,Menlo,monospace;font-size:14px}
+.chk{display:flex;gap:8px;align-items:center;font-weight:400}.chk input{width:auto;margin:0}
+button{padding:10px 16px;border:0;border-radius:8px;background:var(--acc);color:#fff;font:inherit;font-weight:600;cursor:pointer}
+button.bad{background:var(--bad)}button.big{width:100%;padding:16px;font-size:18px}
+table{width:100%;border-collapse:collapse}td{padding:6px 4px;border-bottom:1px solid var(--bd);vertical-align:top;overflow-wrap:anywhere}
+td:first-child{color:var(--mut);white-space:nowrap;padding-right:12px;width:1%}
+.warn{border-color:var(--bad)}.ok{color:var(--ok)}.err{color:var(--bad)}.row{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+)CSS";
+
+bool auth() {
+  if (!cfg.webPass.length()) return true;
+  if (server.authenticate("admin", cfg.webPass.c_str())) return true;
+  server.requestAuthentication(BASIC_AUTH, "Intercom");
+  return false;
+}
+
+bool csrfOk() {
+  if (server.arg("csrf") == csrf) return true;
+  server.send(403, "text/plain; charset=utf-8", "Ошибка проверки формы. Обновите страницу и повторите.");
+  return false;
+}
+
+String csrfField() { return "<input type='hidden' name='csrf' value='" + csrf + "'>"; }
+
+void redirect(const String &to) { server.sendHeader("Location", to); server.send(303, "text/plain", ""); }
+
+void sendPage(const char *active, const String &title, const String &body) {
+  String h; h.reserve(body.length() + 3200);
+  h += F("<!doctype html><html lang='ru'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>");
+  h += esc(title); h += F("</title><style>"); h += FPSTR(CSS); h += F("</style></head><body><nav>");
+  const char *items[][2] = {{"/", "Главная"}, {"/guests", "Гости"}, {"/settings", "Настройки"}, {"/wifi", "WiFi"}, {"/update", "Обновление"}};
+  for (auto &it : items) {
+    h += "<a href='"; h += it[0]; h += "'"; if (!strcmp(active, it[0])) h += " class='on'"; h += ">"; h += it[1]; h += "</a>";
+  }
+  h += "</nav><main>"; h += body; h += F("</main></body></html>");
+  server.send(200, "text/html; charset=utf-8", h);
+}
+
+String row(const String &k, const String &v) { return "<tr><td>" + k + "</td><td>" + v + "</td></tr>"; }
 
 void handleRoot() {
-  String page = "<!DOCTYPE html><html><head><meta charset='utf-8'>";
-  page += "<title>Telegram Intercom</title>";
-  page += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
-  page += "<style>";
-  page += "body{font-family:Arial,sans-serif;margin:20px;background:#f5f5f5}";
-  page += ".container{max-width:800px;margin:0 auto;background:white;padding:20px;border-radius:10px;box-shadow:0 2px 10px rgba(0,0,0,0.1)}";
-  page += ".status{background:#e8f5e8;padding:15px;border-radius:5px;margin:10px 0}";
-  page += ".controls{background:#f0f8ff;padding:15px;border-radius:5px;margin:10px 0}";
-  page += "a{color:#0066cc;text-decoration:none;margin-right:15px}";
-  page += "a:hover{text-decoration:underline}";
-  page += "</style>";
-  page += "</head><body>";
-  page += "<div class='container'>";
-  page += "<h1>🏠 Telegram Intercom System</h1>";
-  
-  page += "<div class='status'>";
-  page += "<h2>📊 System Status</h2>";
-  page += "<p><strong>WiFi:</strong> " + String(WiFi.status() == WL_CONNECTED ? "✅ Connected" : "❌ Disconnected") + "</p>";
-  page += "<p><strong>IP Address:</strong> " + WiFi.localIP().toString() + "</p>";
-  page += "<p><strong>Telegram:</strong> " + String(telegramConnected ? "✅ Connected" : "❌ Disconnected") + "</p>";
-  page += "<p><strong>Telegram Port:</strong> " + String(workingTelegramPort) + "</p>";
-  page += "<p><strong>SSL Mode:</strong> 🔓 Insecure (Livebox 6 compatible)</p>";
-  page += "<p><strong>Uptime:</strong> " + String(millis() / 60000) + " minutes</p>";
-  page += "<p><strong>Free Memory:</strong> " + String(ESP.getFreeHeap()) + " bytes</p>";
-  page += "<p><strong>Reboot Count:</strong> " + String(settings.rebootCount) + "</p>";
-  page += "</div>";
-  
-  page += "<div class='controls'>";
-  page += "<h2>🔧 Controls</h2>";
-  page += "<p><a href='/settings'>⚙️ Settings</a>";
-  page += "<a href='/wifi'>📶 WiFi Setup</a>";
-  page += "<a href='/otainfo'><strong>🔄 OTA Update (ElegantOTA)</strong></a>";
-  page += "<a href='/test'>🧪 Test Telegram</a>";
-  page += "<a href='/reboot'>🔄 Reboot System</a></p>";
-  page += "<div style='background:#e8f4f8;padding:10px;border-radius:5px;margin:10px 0'>";
-  page += "<small>📋 <strong>OTA Update:</strong> Upload firmware via web interface<br>";
-  page += "🌐 <strong>Direct link:</strong> <a href='/update' target='_blank'>http://intercom.local/update</a></small>";
-  page += "</div>";
-  page += "</div>";
-  
-  page += "</div></body></html>";
-  
-  server.send(200, "text/html; charset=utf-8", page);
-}
+  if (!auth()) return;
+  String b;
+  if (!cfg.token.length() || !cfg.admin.length())
+    b += "<div class='card warn'><b class='err'>Бот не настроен.</b> Укажите токен и chat_id администратора в <a href='/settings'>настройках</a>.</div>";
+  if (!cfg.webPass.length())
+    b += "<div class='card warn'><b class='err'>Пароль портала не задан.</b> Любой в вашей сети может менять настройки и прошивку. Задайте его в <a href='/settings'>настройках</a>.</div>";
 
-void handleSettings() {
-  String page = "<!DOCTYPE html><html><head><meta charset='utf-8'>";
-  page += "<title>Settings - Telegram Intercom</title>";
-  page += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
-  page += "<style>";
-  page += "body{font-family:Arial,sans-serif;margin:20px;background:#f5f5f5}";
-  page += ".container{max-width:800px;margin:0 auto;background:white;padding:20px;border-radius:10px;box-shadow:0 2px 10px rgba(0,0,0,0.1)}";
-  page += ".setting{margin:15px 0;padding:10px;border:1px solid #ddd;border-radius:5px}";
-  page += "input[type=number]{width:100px;padding:5px}";
-  page += "button{background:#0066cc;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer}";
-  page += "button:hover{background:#0052a3}";
-  page += ".warning{background:#fff3cd;color:#856404;padding:10px;border-radius:5px;margin:10px 0}";
-  page += "</style>";
-  page += "</head><body>";
-  page += "<div class='container'>";
-  page += "<h1>⚙️ System Settings</h1>";
-  page += "<p><a href='/'>← Back to Status</a></p>";
-  
-  page += "<div class='warning'>";
-  page += "⚠️ <strong>Warning:</strong> Changing these settings will restart the system!";
-  page += "</div>";
-  
-  page += "<form method='POST' action='/save'>";
-  
-  page += "<div class='setting'>";
-  page += "<h3>🏢 Intercom Type</h3>";
-  page += "<select name='intercomType'>";
-  page += String("<option value='0'") + (settings.intercomType == INTERCOM_FULL ? " selected" : "") + ">Full — screen + camera button + call detection</option>";
-  page += String("<option value='1'") + (settings.intercomType == INTERCOM_SIMPLE ? " selected" : "") + ">Simple — no screen, only 'Open door' (solid-state relay)</option>";
-  page += "</select>";
-  page += "<small><br>Simple type disables the camera/display output and incoming call detection.</small>";
-  page += "</div>";
-  
-  page += "<div class='setting'>";
-  page += "<h3>🎥 Camera Settings</h3>";
-  page += "<label>Camera Activation Time (ms): </label>";
-  page += "<input type='number' name='cameraTime' value='" + String(settings.cameraActivationTime) + "' min='100' max='10000'>";
-  page += "<small> (100-10000ms)</small>";
-  page += "</div>";
-  
-  page += "<div class='setting'>";
-  page += "<h3>🚪 Door Settings</h3>";
-  page += "<label>Door Activation Time (ms): </label>";
-  page += "<input type='number' name='doorTime' value='" + String(settings.doorActivationTime) + "' min='500' max='5000'>";
-  page += "<small> (500-5000ms)</small>";
-  page += "</div>";
-  
-  page += "<div class='setting'>";
-  page += "<h3>📞 Call Detection</h3>";
-  page += "<label>Call Threshold (A0 value): </label>";
-  page += "<input type='number' name='threshold' value='" + String(settings.callThreshold) + "' min='0' max='1023'>";
-  page += "<small> (рекомендуется 10–20, current A0: " + String(analogRead(callIndicatorPin)) + ")</small><br><br>";
-  page += "<label>Call Debounce Time (ms): </label>";
-  page += "<input type='number' name='debounce' value='" + String(settings.callDebounceTime) + "' min='1000' max='60000'>";
-  page += "<small> (1000-60000ms)</small>";
-  page += "</div>";
-  
-  page += "<div class='setting'>";
-  page += "<h3>🐕 Watchdog Settings</h3>";
-  page += "<label>Watchdog Timeout (seconds): </label>";
-  page += "<input type='number' name='watchdog' value='" + String(settings.watchdogTimeout) + "' min='1' max='60'>";
-  page += "<small> (1-60 seconds)</small>";
-  page += "</div>";
-  
-  page += "<br><button type='submit'>💾 Save Settings & Reboot</button>";
-  page += "</form>";
-  
-  page += "</div></body></html>";
-  
-  server.send(200, "text/html; charset=utf-8", page);
-}
+  b += "<div class='card'><form method='post' action='/open'" + String(cfg.confirmOpen ? " onsubmit=\"return confirm('Открыть дверь?')\"" : "") +
+       ">" + csrfField() + "<button class='big'>🚪 Открыть дверь</button></form>";
+  if (hasDisplay()) b += "<div class='row'><form method='post' action='/display'>" + csrfField() + "<button>📺 Включить экран</button></form></div>";
+  b += "</div>";
 
-void handleSaveSettings() {
-  if (server.hasArg("intercomType")) {
-    int t = server.arg("intercomType").toInt();
-    settings.intercomType = (t == INTERCOM_SIMPLE) ? INTERCOM_SIMPLE : INTERCOM_FULL;
-  }
-  if (server.hasArg("cameraTime")) {
-    settings.cameraActivationTime = server.arg("cameraTime").toInt();
-  }
-  if (server.hasArg("doorTime")) {
-    settings.doorActivationTime = server.arg("doorTime").toInt();
-  }
-  if (server.hasArg("threshold")) {
-    settings.callThreshold = server.arg("threshold").toInt();
-  }
-  if (server.hasArg("debounce")) {
-    settings.callDebounceTime = server.arg("debounce").toInt();
-  }
-  if (server.hasArg("watchdog")) {
-    settings.watchdogTimeout = server.arg("watchdog").toInt();
-  }
-  
-  // Validate settings
-  if (settings.cameraActivationTime < 100) settings.cameraActivationTime = 100;
-  if (settings.cameraActivationTime > 10000) settings.cameraActivationTime = 10000;
-  if (settings.doorActivationTime < 500) settings.doorActivationTime = 500;
-  if (settings.doorActivationTime > 5000) settings.doorActivationTime = 5000;
-  if (settings.callThreshold < 0) settings.callThreshold = 0;
-  if (settings.callThreshold > 1023) settings.callThreshold = 1023;
-  if (settings.callDebounceTime < 1000) settings.callDebounceTime = 1000;
-  if (settings.callDebounceTime > 60000) settings.callDebounceTime = 60000;
-  if (settings.watchdogTimeout < 1) settings.watchdogTimeout = 1;
-  if (settings.watchdogTimeout > 60) settings.watchdogTimeout = 60;
-  
-  saveSettings();
-  
-  String page = "<!DOCTYPE html><html><head><meta charset='utf-8'>";
-  page += "<meta http-equiv='refresh' content='3;url=/'>";
-  page += "<title>Settings Saved</title>";
-  page += "</head><body>";
-  page += "<h1>✅ Settings Saved!</h1>";
-  page += "<p>System will reboot in 3 seconds...</p>";
-  page += "</body></html>";
-  
-  server.send(200, "text/html; charset=utf-8", page);
-    
-    delay(1000);
-    ESP.restart();
-  }
-  
-void handleTest() {
-  String result = "❌ Failed";
-  if (telegramConnected) {
-    bool sent = bot.sendMessage(CHAT_ID, "🧪 Web test message from " + WiFi.localIP().toString(), "");
-    if (sent) {
-      result = "✅ Success";
-      lastSuccessfulMessage = millis();
+  String tg;
+  if (!cfg.token.length()) tg = "<span class='err'>не настроен</span>";
+  else if (tgOk) tg = "<span class='ok'>подключён</span> @" + esc(tgBotName);
+  else if (!tgCheckedOnce) tg = "<span class='mut'>проверяется…</span>";
+  else tg = "<span class='err'>нет связи</span>" + String(cfg.tlsVerify ? "<small>Если не проходит, проверьте токен или выключите проверку сертификата в настройках.</small>" : "");
+  b += "<div class='card'><h2>Состояние</h2><table>";
+  b += row("Домофон", hasDisplay() ? "с экраном" : "простой, без экрана");
+  b += row("Telegram", tg);
+  b += row("Home Assistant", mqttStatus());
+  int guests = 0; long now = nowEpoch();
+  forEachGuest([&](const String &, long e, const String &) { if (e > now) guests++; return true; });
+  b += row("Гости", guests ? "<a href='/guests'>" + String(guests) + " с активным доступом</a>" : "нет");
+  b += row("Адрес", "http://" + esc(cfg.host) + ".local · " + WiFi.localIP().toString());
+  b += row("WiFi", esc(WiFi.SSID()) + " · " + String(WiFi.RSSI()) + " dBm");
+  b += row("Время", timeValid() ? fmtTime(time(nullptr), 0) : "<span class='err'>не синхронизировано</span>");
+  b += row("Работает", fmtUptime(millis() / 1000) + " · загрузка №" + String(bootCount));
+  b += row("Память", String(ESP.getFreeHeap() / 1024) + " КБ свободно");
+  if (hasDisplay()) b += row("Датчик звонка", "A=" + String(analogRead(PIN_CALL)) + " (порог " + String(cfg.threshold) + ")");
+  b += row("Прошивка", FW_VERSION " · " BOARD_NAME);
+  b += "</table></div>";
+
+  b += "<div class='card'><h2>Журнал</h2>";
+  if (!logCount) b += "<p class='mut'>Пока пусто</p>";
+  else {
+    b += "<table>";
+    for (int i = 0; i < logCount; i++) {
+      LogEntry &e = logBuf[(logHead - 1 - i + LOG_SIZE) % LOG_SIZE];
+      b += row(fmtTime(e.t, e.ms), esc(e.text));
     }
+    b += "</table>";
   }
-  
-  String page = "<!DOCTYPE html><html><head><meta charset='utf-8'>";
-  page += "<meta http-equiv='refresh' content='3;url=/'>";
-  page += "<title>Telegram Test</title>";
-  page += "</head><body>";
-  page += "<h1>📤 Telegram Test: " + result + "</h1>";
-  page += "<p>Returning to main page...</p>";
-  page += "</body></html>";
-  
-  server.send(200, "text/html; charset=utf-8", page);
+  b += "<p class='mut'>Хранится в памяти до перезагрузки, последние " + String(LOG_SIZE) + " событий.</p></div>";
+
+  b += "<div class='card'><h2>Действия</h2><div class='row'>";
+  b += "<form method='post' action='/tgtest'>" + csrfField() + "<button>Тестовое сообщение админу</button></form>";
+  b += "<form method='post' action='/reboot' onsubmit=\"return confirm('Перезагрузить?')\">" + csrfField() + "<button class='bad'>Перезагрузить</button></form>";
+  b += "</div></div>";
+  sendPage("/", "Домофон", b);
 }
 
-void handleWiFi() {
-  String page = "<!DOCTYPE html><html><head><meta charset='utf-8'>";
-  page += "<title>WiFi Setup - Telegram Intercom</title>";
-  page += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
-  page += "<style>";
-  page += "body{font-family:Arial,sans-serif;margin:20px;background:#f5f5f5}";
-  page += ".container{max-width:800px;margin:0 auto;background:white;padding:20px;border-radius:10px;box-shadow:0 2px 10px rgba(0,0,0,0.1)}";
-  page += ".wifi-info{background:#e8f4f8;padding:15px;border-radius:5px;margin:10px 0}";
-  page += ".wifi-controls{background:#fff3cd;padding:15px;border-radius:5px;margin:10px 0}";
-  page += "button{background:#0066cc;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer;margin:5px}";
-  page += "button:hover{background:#0052a3}";
-  page += ".danger{background:#dc3545}";
-  page += ".danger:hover{background:#c82333}";
-  page += ".warning{background:#ffc107;color:#000}";
-  page += ".warning:hover{background:#e0a800}";
-  page += "</style>";
-  page += "</head><body>";
-  page += "<div class='container'>";
-  page += "<h1>📶 WiFi Setup</h1>";
-  page += "<p><a href='/'>← Back to Status</a></p>";
-  
-  page += "<div class='wifi-info'>";
-  page += "<h2>📊 Current WiFi Status</h2>";
-  page += "<p><strong>Status:</strong> " + String(WiFi.status() == WL_CONNECTED ? "✅ Connected" : "❌ Disconnected") + "</p>";
-  if (WiFi.status() == WL_CONNECTED) {
-    page += "<p><strong>SSID:</strong> " + WiFi.SSID() + "</p>";
-    page += "<p><strong>IP Address:</strong> " + WiFi.localIP().toString() + "</p>";
-    page += "<p><strong>Gateway:</strong> " + WiFi.gatewayIP().toString() + "</p>";
-    page += "<p><strong>DNS:</strong> " + WiFi.dnsIP().toString() + "</p>";
-    page += "<p><strong>Signal Strength:</strong> " + String(WiFi.RSSI()) + " dBm</p>";
-    page += "<p><strong>MAC Address:</strong> " + WiFi.macAddress() + "</p>";
-  }
-  page += "</div>";
-  
-  page += "<div class='wifi-controls'>";
-  page += "<h2>🔧 WiFi Controls</h2>";
-  page += "<p><strong>WiFi AutoConnect:</strong> Enabled ✅</p>";
-  page += "<p>System automatically connects to saved WiFi networks on startup.</p>";
-  page += "<br>";
-  
-  page += "<button onclick=\"location.href='/wifi/scan'\">🔍 Scan Networks</button>";
-  page += "<button onclick=\"location.href='/wifi/portal'\" class='warning'>⚙️ WiFi Config Portal</button>";
-  page += "<button onclick=\"if(confirm('Reset WiFi settings? Device will restart in AP mode.')) location.href='/wifi/reset'\" class='danger'>🗑️ Reset WiFi</button>";
-  page += "</div>";
-  
-  page += "<div style='background:#f8f9fa;padding:15px;border-radius:5px;margin:10px 0'>";
-  page += "<h3>📋 WiFi Commands</h3>";
-  page += "<ul>";
-  page += "<li><strong>Scan Networks:</strong> Show available WiFi networks</li>";
-  page += "<li><strong>Config Portal:</strong> Open WiFiManager portal (device will restart)</li>";
-  page += "<li><strong>Reset WiFi:</strong> Clear saved credentials and restart in AP mode</li>";
-  page += "</ul>";
-  page += "</div>";
-  
-  page += "</div></body></html>";
-  
-  server.send(200, "text/html; charset=utf-8", page);
+void handleOpen() {
+  if (!auth() || !csrfOk()) return;
+  if (openDoor()) addLog("🚪 Открыто через веб-портал");
+  redirect("/");
 }
 
-void handleWiFiScan() {
-  String page = "<!DOCTYPE html><html><head><meta charset='utf-8'>";
-  page += "<title>WiFi Scan - Telegram Intercom</title>";
-  page += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
-  page += "<meta http-equiv='refresh' content='30'>";  // Auto refresh every 30 seconds
-  page += "<style>";
-  page += "body{font-family:Arial,sans-serif;margin:20px;background:#f5f5f5}";
-  page += ".container{max-width:800px;margin:0 auto;background:white;padding:20px;border-radius:10px;box-shadow:0 2px 10px rgba(0,0,0,0.1)}";
-  page += ".network{background:#f8f9fa;padding:10px;margin:5px 0;border-radius:5px;border-left:4px solid #0066cc}";
-  page += ".strong{color:#28a745}";
-  page += ".medium{color:#ffc107}";
-  page += ".weak{color:#dc3545}";
-  page += "</style>";
-  page += "</head><body>";
-  page += "<div class='container'>";
-  page += "<h1>🔍 WiFi Network Scan</h1>";
-  page += "<p><a href='/wifi'>← Back to WiFi Setup</a></p>";
-  
-  page += "<p>🔄 Scanning for networks... (auto-refresh every 30s)</p>";
-  
-  // Perform WiFi scan
-  int networkCount = WiFi.scanNetworks();
-  
-  if (networkCount == 0) {
-    page += "<p>❌ No networks found</p>";
-  } else {
-    page += "<p>📡 Found " + String(networkCount) + " networks:</p>";
-    
-    for (int i = 0; i < networkCount; i++) {
-      String ssid = WiFi.SSID(i);
-      int rssi = WiFi.RSSI(i);
-      String security = (WiFi.encryptionType(i) == WIFI_AUTH_OPEN) ? "🔓 Open" : "🔒 Secured";
-      
-      String signalClass = "weak";
-      String signalText = "Weak";
-      if (rssi > -50) {
-        signalClass = "strong";
-        signalText = "Strong";
-      } else if (rssi > -70) {
-        signalClass = "medium";
-        signalText = "Medium";
-      }
-      
-      page += "<div class='network'>";
-      page += "<strong>" + ssid + "</strong> " + security;
-      page += "<br><span class='" + signalClass + "'>📶 " + signalText + " (" + String(rssi) + " dBm)</span>";
-      page += "</div>";
-    }
-  }
-  
-  page += "</div></body></html>";
-  
-  server.send(200, "text/html; charset=utf-8", page);
+void handleDisplay() {
+  if (!auth() || !csrfOk()) return;
+  if (viewDisplay()) addLog("📺 Экран через веб-портал");
+  redirect("/");
 }
 
-void handleWiFiPortal() {
-  String page = "<!DOCTYPE html><html><head><meta charset='utf-8'>";
-  page += "<meta http-equiv='refresh' content='5;url=http://192.168.4.1'>";
-  page += "<title>WiFi Portal Starting</title>";
-  page += "</head><body>";
-  page += "<h1>📶 Starting WiFi Configuration Portal...</h1>";
-  page += "<p>Device will restart and create 'TelegramIntercom' network.</p>";
-  page += "<p>Connect to 'TelegramIntercom' and go to 192.168.4.1</p>";
-  page += "<p>Redirecting in 5 seconds...</p>";
-  page += "</body></html>";
-  
-  server.send(200, "text/html; charset=utf-8", page);
-  
-  delay(2000);
-  WiFiManager wm;
-  wm.resetSettings();  // Clear saved WiFi
-  ESP.restart();       // Restart to enter portal mode
-}
-
-void handleWiFiReset() {
-  String page = "<!DOCTYPE html><html><head><meta charset='utf-8'>";
-  page += "<meta http-equiv='refresh' content='5;url=http://192.168.4.1'>";
-  page += "<title>WiFi Reset</title>";
-  page += "</head><body>";
-  page += "<h1>🗑️ WiFi Settings Reset</h1>";
-  page += "<p>All WiFi credentials cleared!</p>";
-  page += "<p>Device will restart in AP mode as 'TelegramIntercom'</p>";
-  page += "<p>Connect to 'TelegramIntercom' network and go to 192.168.4.1</p>";
-  page += "<p>Redirecting in 5 seconds...</p>";
-    page += "</body></html>";
-  
-  server.send(200, "text/html; charset=utf-8", page);
-  
-  delay(2000);
-  WiFiManager wm;
-  wm.resetSettings();  // Clear all saved WiFi credentials
-  ESP.restart();       // Restart to enter AP mode
-}
-
-void handleOTAInfo() {
-  String page = "<!DOCTYPE html><html><head><meta charset='utf-8'>";
-  page += "<title>OTA Update Info - Telegram Intercom</title>";
-  page += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
-  page += "<style>";
-  page += "body{font-family:Arial,sans-serif;margin:20px;background:#f5f5f5}";
-  page += ".container{max-width:800px;margin:0 auto;background:white;padding:20px;border-radius:10px;box-shadow:0 2px 10px rgba(0,0,0,0.1)}";
-  page += ".ota-info{background:#e8f4f8;padding:15px;border-radius:5px;margin:10px 0}";
-  page += ".warning{background:#fff3cd;color:#856404;padding:15px;border-radius:5px;margin:10px 0}";
-  page += "button{background:#0066cc;color:white;padding:15px 30px;border:none;border-radius:5px;cursor:pointer;font-size:16px}";
-  page += "button:hover{background:#0052a3}";
-  page += ".step{background:#f8f9fa;padding:10px;margin:5px 0;border-left:4px solid #0066cc;border-radius:3px}";
-  page += "</style>";
-  page += "</head><body>";
-  page += "<div class='container'>";
-  page += "<h1>🔄 OTA (Over-The-Air) Update</h1>";
-  page += "<p><a href='/'>← Back to Status</a></p>";
-  
-  page += "<div class='ota-info'>";
-  page += "<h2>📊 Current System Info</h2>";
-  page += "<p><strong>Chip ID:</strong> " + String((uint32_t)ESP.getEfuseMac(), HEX) + "</p>";
-  page += "<p><strong>Flash Size:</strong> " + String(ESP.getFlashChipSize()) + " bytes</p>";
-  page += "<p><strong>Free Space:</strong> " + String(ESP.getFreeSketchSpace()) + " bytes</p>";
-  page += "<p><strong>Sketch Size:</strong> " + String(ESP.getSketchSize()) + " bytes</p>";
-  page += "<p><strong>Core Version:</strong> " + String(ESP.getSdkVersion()) + "</p>";
-  page += "<p><strong>IDF Version:</strong> " + String(ESP.getSdkVersion()) + "</p>";
-  page += "</div>";
-  
-  page += "<div class='warning'>";
-  page += "⚠️ <strong>Warning:</strong> Do not power off the device during OTA update!<br>";
-  page += "📶 Ensure stable WiFi connection before starting update.";
-  page += "</div>";
-  
-  page += "<h2>📋 How to Update</h2>";
-  page += "<div class='step'>1. Compile your code in Arduino IDE</div>";
-  page += "<div class='step'>2. Go to Sketch → Export compiled Binary</div>";
-  page += "<div class='step'>3. Click 'Go to ElegantOTA' button below</div>";
-  page += "<div class='step'>4. Upload the .bin file</div>";
-  page += "<div class='step'>5. Wait for completion and device restart</div>";
-  
-  page += "<br>";
-  page += "<button onclick=\"window.open('/update', '_blank')\">🚀 Go to ElegantOTA Update Page</button>";
-  
-  page += "<h3>🔗 Direct Links</h3>";
-  page += "<ul>";
-  page += "<li><a href='/update' target='_blank'>ElegantOTA Update Interface</a></li>";
-  page += "<li><a href='http://" + WiFi.localIP().toString() + "/update' target='_blank'>Direct IP Access</a></li>";
-  page += "</ul>";
-  
-  page += "</div></body></html>";
-  
-  server.send(200, "text/html; charset=utf-8", page);
+void handleTgTest() {
+  if (!auth() || !csrfOk()) return;
+  bool ok = cfg.token.length() && cfg.admin.length() && bot.sendMessage(cfg.admin, "🧪 Тест из веб-портала", "");
+  addLog(ok ? "🧪 Тестовое сообщение отправлено" : "🧪 Тестовое сообщение не отправлено");
+  redirect("/");
 }
 
 void handleReboot() {
-  String page = "<!DOCTYPE html><html><head><meta charset='utf-8'>";
-  page += "<meta http-equiv='refresh' content='5;url=/'>";
-  page += "<title>System Reboot</title>";
-  page += "</head><body>";
-  page += "<h1>🔄 System Rebooting...</h1>";
-  page += "<p>Please wait 30 seconds and refresh the page.</p>";
-  page += "</body></html>";
-  
-  server.send(200, "text/html; charset=utf-8", page);
-  
-  delay(1000);
+  if (!auth() || !csrfOk()) return;
+  sendPage("/", "Перезагрузка", "<div class='card'>Перезагрузка… Страница обновится через 15 секунд.</div><meta http-equiv='refresh' content='15;url=/'>");
+  delay(500); ESP.restart();
+}
+
+String settingsBody(const String &msg, const String &errs) {
+  String b;
+  if (msg.length()) b += "<div class='card'><b class='ok'>" + esc(msg) + "</b></div>";
+  if (errs.length()) b += "<div class='card warn'><b class='err'>Не всё сохранено:</b> " + esc(errs) + "</div>";
+  b += "<form method='post' action='/settings'>" + csrfField();
+
+  b += "<div class='card'><h2>Telegram</h2>";
+  b += "<label>Токен бота</label><input type='password' name='token' autocomplete='off' placeholder='";
+  b += cfg.token.length() ? "сохранён — оставьте пустым, чтобы не менять" : "123456789:AA…";
+  b += "'><small>Выдаёт @BotFather. После сохранения токен не показывается.</small>";
+  b += "<label>chat_id администратора</label><input name='admin' value='" + esc(cfg.admin) + "' inputmode='numeric'>";
+  b += "<small>Админ открывает дверь, получает уведомления и управляет списком через /allow, /deny, /list.</small>";
+  b += "<label>Пользователи с доступом</label><textarea name='users' placeholder='123456789 Мама&#10;987654321 Соседка'>" + esc(cfg.users) + "</textarea>";
+  b += "<small>По одному в строке: chat_id, затем через пробел имя (по желанию). Свой chat_id человек увидит, если напишет боту.</small>";
+  b += "<label class='chk'><input type='checkbox' name='notifyAll'" + String(cfg.notifyAll ? " checked" : "") + ">Уведомлять о звонке всех пользователей, а не только админа</label>";
+  b += "<label>Не выполнять команды старше, с</label><input type='number' name='maxAge' min='10' max='3600' value='" + String(cfg.maxAgeS) + "'>";
+  b += "<small>Защита от того, что дверь откроется спустя время, если команда застряла, пока не было связи.</small>";
+  b += "<label class='chk'><input type='checkbox' name='confirmOpen'" + String(cfg.confirmOpen ? " checked" : "") + ">Спрашивать подтверждение перед открытием</label>";
+  b += "<small>После «Открыть» бот пришлёт кнопку «Да, открыть» (действует " + String(CONFIRM_BTN_S) + " с) — защита от случайного нажатия. Кнопка «Открыть» в уведомлении о звонке срабатывает сразу.</small>";
+  b += "<label class='chk'><input type='checkbox' name='tlsVerify'" + String(cfg.tlsVerify ? " checked" : "") + ">Проверять сертификат Telegram (рекомендуется)</label>";
+  b += "</div>";
+
+  b += "<div class='card'><h2>Home Assistant (MQTT)</h2>";
+  b += "<label class='chk'><input type='checkbox' name='mqttOn'" + String(cfg.mqttOn ? " checked" : "") + ">Включить</label>";
+  b += "<label>Адрес брокера</label><input name='mqttHost' value='" + esc(cfg.mqttHost) + "' placeholder='IP брокера, например 192.168.1.10'>";
+  b += "<label>Порт</label><input type='number' name='mqttPort' min='1' max='65535' value='" + String(cfg.mqttPort) + "'>";
+  b += "<label>Логин</label><input name='mqttUser' value='" + esc(cfg.mqttUser) + "' autocomplete='off'>";
+  b += "<label>Пароль</label><input type='password' name='mqttPass' autocomplete='off' placeholder='";
+  b += cfg.mqttPass.length() ? "сохранён — оставьте пустым, чтобы не менять" : "";
+  b += "'><small>Домофон появится в Home Assistant сам (MQTT discovery): кнопки «Открыть дверь» и «Включить экран», датчик «Звонок», «Последнее событие». Топики: " +
+       esc(mqttBase()) + "/…</small>";
+  b += "</div>";
+
+  b += "<div class='card'><h2>Домофон</h2><label>Тип</label><select name='type'>";
+  b += "<option value='1'" + String(cfg.type == INTERCOM_SIMPLE ? " selected" : "") + ">Простой — без экрана, только «Открыть»</option>";
+  b += "<option value='0'" + String(cfg.type == INTERCOM_FULL ? " selected" : "") + ">С экраном — камера, экран, датчик звонка</option></select>";
+  b += "<label>Сколько держать кнопку «Открыть», мс</label><input type='number' name='doorMs' min='100' max='10000' value='" + String(cfg.doorMs) + "'>";
+  b += "<small>Выход GPIO" + String(PIN_DOOR) + " → твердотельное реле. 100–10000 мс.</small>";
+  b += "<details" + String(hasDisplay() ? " open" : "") + "><summary class='mut' style='margin-top:14px'>Только для домофона с экраном</summary>";
+  b += "<label>Сколько держать кнопку экрана, мс</label><input type='number' name='camMs' min='100' max='10000' value='" + String(cfg.camMs) + "'>";
+  b += "<label>Порог датчика звонка (0–1023)</label><input type='number' name='threshold' min='0' max='1023' value='" + String(cfg.threshold) + "'>";
+  b += "<small>Сейчас датчик показывает " + String(analogRead(PIN_CALL)) + ". Звонок — когда значение ниже порога.</small>";
+  b += "<label>Пауза между уведомлениями о звонке, мс</label><input type='number' name='debounceMs' min='1000' max='60000' value='" + String(cfg.debounceMs) + "'>";
+  b += "</details></div>";
+
+  b += "<div class='card'><h2>Устройство</h2>";
+  b += "<label>Имя в сети</label><input name='host' value='" + esc(cfg.host) + "' pattern='[a-z0-9-]{1,30}'>";
+  b += "<small>Портал будет доступен по адресу http://<b>" + esc(cfg.host) + "</b>.local. Латиница, цифры и дефис.</small>";
+  b += "<label>Часовой пояс (POSIX TZ)</label><input name='tz' value='" + esc(cfg.tz) + "'>";
+  b += "<small>Для Испании: CET-1CEST,M3.5.0,M10.5.0/3</small>";
+  b += "<label>Новый пароль портала и OTA</label><input type='password' name='pass1' autocomplete='new-password' placeholder='";
+  b += cfg.webPass.length() ? "задан — оставьте пустым, чтобы не менять" : "не задан";
+  b += "'><input type='password' name='pass2' autocomplete='new-password' placeholder='повторите пароль' style='margin-top:6px'>";
+  b += "<small>Логин: <b>admin</b>. Минимум 8 символов. Этот же пароль ставится на точку доступа WiFi-настройки.</small>";
+  if (cfg.webPass.length()) b += "<label class='chk'><input type='checkbox' name='passClear'>Убрать пароль</label>";
+  b += "</div><button class='big'>💾 Сохранить</button></form>";
+  return b;
+}
+
+void handleSettings() {
+  if (!auth()) return;
+  sendPage("/settings", "Настройки", settingsBody("", ""));
+}
+
+void startMdns() {
+  MDNS.end();
+  if (MDNS.begin(cfg.host.c_str())) MDNS.addService("http", "tcp", 80);
+}
+
+void applyOtaAuth() {
+  if (cfg.webPass.length()) ElegantOTA.setAuth("admin", cfg.webPass.c_str());
+  else ElegantOTA.clearAuth();
+}
+
+void handleSettingsSave() {
+  if (!auth() || !csrfOk()) return;
+  String errs;
+  String oldHost = cfg.host, oldToken = cfg.token;
+  bool oldTls = cfg.tlsVerify;
+
+  String tok = server.arg("token"); tok.trim();
+  if (tok.length()) { if (validToken(tok)) cfg.token = tok; else errs += "Токен не похож на токен бота. "; }
+
+  String adm = server.arg("admin"); adm.trim();
+  if (!adm.length() || validChatId(adm)) cfg.admin = adm; else errs += "chat_id администратора — только цифры. ";
+
+  cfg.users = normalizeUsers(server.arg("users"), errs);
+  cfg.notifyAll = server.hasArg("notifyAll");
+  cfg.tlsVerify = server.hasArg("tlsVerify");
+  cfg.confirmOpen = server.hasArg("confirmOpen");
+  uint8_t oldType = cfg.type;
+  bool oldMqttOn = cfg.mqttOn;
+  String oldMqtt = cfg.mqttHost + ":" + cfg.mqttPort + ":" + cfg.mqttUser + ":" + cfg.mqttPass;
+  cfg.mqttOn = server.hasArg("mqttOn");
+  String mh = server.arg("mqttHost"); mh.trim();
+  if (mh.length() < 64) cfg.mqttHost = mh;
+  cfg.mqttPort = constrain(server.arg("mqttPort").toInt(), 1, 65535);
+  String mu = server.arg("mqttUser"); mu.trim();
+  if (mu.length() < 64) cfg.mqttUser = mu;
+  String mp = server.arg("mqttPass");
+  if (mp.length() && mp.length() < 64) cfg.mqttPass = mp;
+  if (!mu.length()) cfg.mqttPass = "";
+  if (cfg.mqttOn && !cfg.mqttHost.length()) errs += "MQTT: укажите адрес брокера. ";
+  cfg.maxAgeS   = constrain(server.arg("maxAge").toInt(), 10, 3600);
+  cfg.type      = server.arg("type").toInt() == INTERCOM_SIMPLE ? INTERCOM_SIMPLE : INTERCOM_FULL;
+  cfg.doorMs    = constrain(server.arg("doorMs").toInt(), 100, 10000);
+  cfg.camMs     = constrain(server.arg("camMs").toInt(), 100, 10000);
+  cfg.threshold = constrain(server.arg("threshold").toInt(), 0, 1023);
+  cfg.debounceMs = constrain(server.arg("debounceMs").toInt(), 1000, 60000);
+
+  String host = server.arg("host"); host.trim(); host.toLowerCase();
+  if (validHost(host)) cfg.host = host; else errs += "Имя в сети: только a-z, 0-9 и дефис. ";
+
+  String tz = server.arg("tz"); tz.trim();
+  if (tz.length() && tz.length() < 60) cfg.tz = tz;
+
+  String p1 = server.arg("pass1"), p2 = server.arg("pass2");
+  if (server.hasArg("passClear")) cfg.webPass = "";
+  else if (p1.length()) {
+    if (p1 != p2) errs += "Пароли не совпадают. ";
+    else if (p1.length() < 8) errs += "Пароль короче 8 символов. ";
+    else cfg.webPass = p1;
+  }
+
+  saveConfig();
+  if (cfg.token != oldToken || cfg.tlsVerify != oldTls) applyTelegram();
+  if (cfg.host != oldHost) { startMdns(); WiFi.setHostname(cfg.host.c_str()); }
+  setenv("TZ", cfg.tz.c_str(), 1); tzset();
+  applyOtaAuth();
+  String newMqtt = cfg.mqttHost + ":" + cfg.mqttPort + ":" + cfg.mqttUser + ":" + cfg.mqttPass;
+  if (newMqtt != oldMqtt || cfg.mqttOn != oldMqttOn || cfg.host != oldHost) mqttRestart();
+  else if (cfg.type != oldType && mqtt.connected()) mqttDiscovery();
+  addLog("⚙️ Настройки изменены");
+
+  String msg = "Сохранено.";
+  if (cfg.host != oldHost) msg += " Новый адрес: http://" + cfg.host + ".local";
+  sendPage("/settings", "Настройки", settingsBody(msg, errs));
+}
+
+void guestsPage(const String &msg, bool bad) {
+  rebuildGuests("");
+  String b;
+  if (msg.length()) b += "<div class='card" + String(bad ? " warn'><b class='err'>" : "'><b class='ok'>") + esc(msg) + "</b></div>";
+  if (!nowEpoch()) b += "<div class='card warn'><b class='err'>Время не синхронизировано</b> — гостевой доступ не работает, пока устройство не получит время из интернета.</div>";
+  b += "<div class='card'><h2>Гости с доступом</h2>";
+  int n = 0; String t = "<table>";
+  forEachGuest([&](const String &g, long e, const String &nm) {
+    n++;
+    t += "<tr><td>до " + fmtUntil(e) + "</td><td>" + esc(nm.length() ? nm : String("—")) + " <span class='mut'>" + esc(g) + "</span>";
+    t += "<form method='post' action='/guests/del' style='margin-top:4px'>" + csrfField() + "<input type='hidden' name='id' value='" + esc(g) +
+         "'><button class='bad' style='padding:4px 10px'>Удалить</button></form></td></tr>";
+    return true;
+  });
+  b += n ? t + "</table>" : String("<p class='mut'>Нет</p>");
+  b += "</div><div class='card'><h2>Добавить гостя</h2><form method='post' action='/guests'>" + csrfField();
+  b += "<label>chat_id</label><input name='id' inputmode='numeric' required>";
+  b += "<label>Имя</label><input name='name' maxlength='32' placeholder='Курьер'>";
+  b += "<label>На сколько часов</label><input type='number' name='hours' min='1' max='720' value='" + String(REQ_GUEST_H) + "'>";
+  b += "<small>Гость может только открывать дверь" + String(hasDisplay() ? " и включать экран" : "") +
+       ". Когда гость открывает дверь, админу приходит сообщение. По истечении срока доступ пропадает сам.</small>";
+  b += "<div class='row'><button>Добавить</button></div></form></div>";
+  b += "<div class='card'><h2>Проще через Telegram</h2><p>Пусть гость напишет боту что угодно. Админу придёт запрос с кнопками "
+       "<b>«Гость на " + String(REQ_GUEST_H) + " ч»</b> и <b>«Добавить»</b>. Или командой: <code>/guest &lt;chat_id&gt; [часов] [имя]</code>, "
+       "убрать — <code>/deny &lt;chat_id&gt;</code>.</p></div>";
+  sendPage("/guests", "Гости", b);
+}
+
+void handleGuests() { if (auth()) guestsPage("", false); }
+
+void handleGuestAdd() {
+  if (!auth() || !csrfOk()) return;
+  String id = server.arg("id"); id.trim();
+  int hours = server.arg("hours").toInt();
+  if (!validChatId(id)) { guestsPage("chat_id — только цифры", true); return; }
+  if (cfg.admin == id || isListedUser(id)) { guestsPage("Этот chat_id уже есть в постоянном списке", true); return; }
+  if (!addGuest(id, hours, server.arg("name"))) { guestsPage("Время не синхронизировано, попробуйте позже", true); return; }
+  addLog("🕐 Гость до " + fmtUntil(guestExpiry(id)) + ": " + userLabel(id) + " (веб-портал)");
+  guestsPage("Добавлен до " + fmtUntil(guestExpiry(id)), false);
+}
+
+void handleGuestDel() {
+  if (!auth() || !csrfOk()) return;
+  String id = server.arg("id");
+  String label = userLabel(id);
+  rebuildGuests(id);
+  addLog("➖ Гость удалён: " + label);
+  redirect("/guests");
+}
+
+void handleWifi() {
+  if (!auth()) return;
+  String b = "<div class='card'><h2>Подключение</h2><table>";
+  b += row("Сеть", esc(WiFi.SSID()));
+  b += row("Сигнал", String(WiFi.RSSI()) + " dBm");
+  b += row("IP", WiFi.localIP().toString());
+  b += row("Шлюз", WiFi.gatewayIP().toString());
+  b += row("MAC", WiFi.macAddress());
+  b += "</table></div><div class='card'><h2>Сменить сеть</h2>";
+  b += "<p>Устройство забудет текущую сеть, перезагрузится и создаст точку доступа <b>Intercom-Setup</b>";
+  b += cfg.webPass.length() >= 8 ? " (пароль — как у портала)" : " (без пароля)";
+  b += ". Подключитесь к ней с телефона — откроется страница выбора сети (или зайдите на 192.168.4.1). Если за 5 минут сеть не выбрана, устройство перезагрузится и снова включит точку доступа.</p>";
+  b += "<form method='post' action='/wifi/reset' onsubmit=\"return confirm('Забыть текущую сеть WiFi?')\">" + csrfField() + "<button class='bad'>Забыть сеть и настроить заново</button></form></div>";
+  sendPage("/wifi", "WiFi", b);
+}
+
+void handleWifiReset() {
+  if (!auth() || !csrfOk()) return;
+  sendPage("/wifi", "WiFi", "<div class='card'>Сеть сброшена. Подключитесь к точке доступа <b>Intercom-Setup</b>.</div>");
+  delay(500);
+  WiFiManager wm; wm.resetSettings();
   ESP.restart();
 }
 
-// ========== SETUP ==========
+void setupWeb() {
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/open", HTTP_POST, handleOpen);
+  server.on("/display", HTTP_POST, handleDisplay);
+  server.on("/tgtest", HTTP_POST, handleTgTest);
+  server.on("/reboot", HTTP_POST, handleReboot);
+  server.on("/settings", HTTP_GET, handleSettings);
+  server.on("/settings", HTTP_POST, handleSettingsSave);
+  server.on("/guests", HTTP_GET, handleGuests);
+  server.on("/guests", HTTP_POST, handleGuestAdd);
+  server.on("/guests/del", HTTP_POST, handleGuestDel);
+  server.on("/wifi", HTTP_GET, handleWifi);
+  server.on("/wifi/reset", HTTP_POST, handleWifiReset);
+  server.onNotFound([] { server.send(404, "text/plain", "Not found"); });
 
-void setup() {
-  Serial.begin(115200);
-  delay(2000);
-  
-  Serial.println("");
-  Serial.println("");
-  Serial.println(FPSTR(PROGMEM_SYSTEM_STARTUP));
-  Serial.println("🔧 ESP32 WROOM-32D Version");
-  Serial.println("⏰ Timestamp: " + String(millis()));
-  Serial.println("🔄 Reset reason: " + String(esp_reset_reason()));
-  Serial.println("💾 Free heap: " + String(ESP.getFreeHeap()) + " bytes");
-  
-  // Initialize EEPROM
-  Serial.println("📝 Initializing EEPROM...");
-  EEPROM.begin(sizeof(IntercomSettings));
-  loadSettings();
-  Serial.println("✅ Settings loaded");
-  
-  // Hardware watchdog
-  Serial.println("🐕 Enabling hardware watchdog...");
-  // ESP32 watchdog is handled automatically
-  Serial.println("✅ Hardware watchdog enabled");
-  
-  // Initialize advanced watchdog system
-  lastLoopTime = millis();
-  lastTelegramActivity = millis();
-  lastWiFiCheck = millis();
-  softwareWatchdogCounter = 0;
-  minFreeHeap = ESP.getFreeHeap();
-  Serial.println("🐕 Advanced watchdog system initialized");
-  
-  // Pin setup
-  pinMode(cameraButtonPin, OUTPUT);
-  pinMode(doorButtonPin, OUTPUT);
-  pinMode(ledPin, OUTPUT);
-  
-  digitalWrite(cameraButtonPin, LOW);
-  digitalWrite(doorButtonPin, LOW);
-  digitalWrite(ledPin, HIGH);
-  
-  // Set ADC resolution to 10-bit for compatibility with ESP8266 (0-1023)
-  analogReadResolution(10);
-  
-  Serial.println("✅ Hardware pins configured");
-  
-  // WiFi setup
-  Serial.println("📶 Setting up WiFi...");
-  
-  // ESP32-specific WiFi configuration for better compatibility
-  WiFi.mode(WIFI_STA);
-  WiFi.setAutoReconnect(true);
-  WiFi.persistent(true);
-  WiFiManager wm;
-  
-  // Simplified WiFiManager configuration for ESP32 stability
-  wm.setTimeout(180);  // Connection timeout
-  wm.setDebugOutput(true);  // Enable debug output
-  
-  // Add small delay for stability
-  delay(1000);
-  
-  Serial.println("🔧 WiFiManager configured for ESP32 stability");
-  Serial.println("💾 Free heap before WiFi: " + String(ESP.getFreeHeap()) + " bytes");
-  
-  if (!wm.autoConnect("TelegramIntercom")) {
-    Serial.println("❌ Failed to connect WiFi");
-    ESP.restart();
-  }
-  
-  Serial.println("✅ WiFi connected");
-  Serial.println("🌐 Connected to network: " + WiFi.SSID());
-  Serial.println("📡 IP address: " + WiFi.localIP().toString());
-  Serial.println("📶 Signal strength: " + String(WiFi.RSSI()) + " dBm");
-  Serial.println("🔧 Gateway: " + WiFi.gatewayIP().toString());
-  Serial.println("📋 MAC address: " + WiFi.macAddress());
-  
-  // NTP setup
-  Serial.println("🕐 Setting up time synchronization...");
-  if (initializeNTP()) {
-    Serial.println("✅ Time synchronized");
-  } else {
-    Serial.println("⚠️ Time sync failed - SSL may have issues");
-  }
-  
-  // mDNS setup
-  if (MDNS.begin("intercom")) {
-    Serial.println("🌐 mDNS started: http://intercom.local/");
-  }
-  
-  // Auto-detect working Telegram port
-  if (!autoPortTestCompleted) {
-    autoDetectTelegramPort();
-    autoPortTestCompleted = true;
-  }
-  
-  // Simple SSL setup with minimal Livebox 6 compatibility
-  Serial.println("🔒 Setting up SSL for Telegram with Livebox 6 compatibility...");
-  client.setInsecure();  // Required for Livebox 6 router - bypass certificate validation
-  
-  // Web server routes
-  server.on("/", handleRoot);
-  server.on("/settings", handleSettings);
-  server.on("/save", HTTP_POST, handleSaveSettings);
-  server.on("/test", handleTest);
-  server.on("/reboot", handleReboot);
-  
-  // WiFi management routes
-  server.on("/wifi", handleWiFi);
-  server.on("/wifi/scan", handleWiFiScan);
-  server.on("/wifi/portal", handleWiFiPortal);
-  server.on("/wifi/reset", handleWiFiReset);
-  
-  // OTA info page
-  server.on("/otainfo", handleOTAInfo);
-  
-  // Initialize ElegantOTA (provides /update endpoint)
   ElegantOTA.begin(&server);
+  applyOtaAuth();
+  ElegantOTA.onStart([] { addLog("🔄 Обновление прошивки…"); });
+  ElegantOTA.onProgress([](size_t, size_t) { esp_task_wdt_reset(); });
+  ElegantOTA.onEnd([](bool ok) { addLog(ok ? "✅ Прошивка обновлена" : "❌ Ошибка обновления"); });
   server.begin();
-  Serial.println("🌐 Web server started with all routes:");
-  Serial.println("  📊 http://intercom.local/ - Main status");
-  Serial.println("  ⚙️ http://intercom.local/settings - Settings");
-  Serial.println("  📶 http://intercom.local/wifi - WiFi setup");
-  Serial.println("  🔄 http://intercom.local/update - ElegantOTA (Firmware Update)");
-  Serial.println("  📋 http://intercom.local/otainfo - OTA Information");
-  Serial.println("✅ ElegantOTA initialized and ready for firmware updates");
-
-  // Test Telegram
-  Serial.println("=== TELEGRAM SETUP ===");
-  if (testTelegramConnectivity()) {
-    telegramConnected = true;
-    
-    // Send simpler startup message to save memory
-    String startupMsg = "🚀 Intercom Started\n";
-    startupMsg += "IP: " + WiFi.localIP().toString() + "\n";
-    startupMsg += "Boot #" + String(settings.rebootCount) + " Ready!";
-    
-    String replyKeyboard = mainKeyboard(false);
-    bool sent = bot.sendMessageWithReplyKeyboard(CHAT_ID, startupMsg, "", replyKeyboard, true, false, false);
-    Serial.println("📤 Startup notification: " + String(sent ? "✅ Sent" : "❌ Failed"));
-    
-    if (sent) {
-      lastSuccessfulMessage = millis();
-      Serial.println("✅ Telegram fully operational");
-    }
-  } else {
-    Serial.println("❌ Telegram connectivity failed");
-  }
-  
-  Serial.println("🔥 SETUP COMPLETED - ENTERING MAIN LOOP");
-  Serial.println("========================================");
-  Serial.println("💡 Serial commands available! Type 'help' for list");
 }
 
-// ========== MAIN LOOP ==========
+// ---------- Setup / loop ----------
+void setup() {
+  // Outputs LOW before enabling them, so the relay never blinks on boot
+  digitalWrite(PIN_DOOR, LOW);   pinMode(PIN_DOOR, OUTPUT);
+  digitalWrite(PIN_CAMERA, LOW); pinMode(PIN_CAMERA, OUTPUT);
+  pinMode(PIN_LED, OUTPUT); led(false);
+
+  Serial.begin(115200);
+  delay(300);
+  Serial.println("\nIntercom " FW_VERSION " / " BOARD_NAME);
+
+  prefs.begin("intercom", false);
+  loadConfig();
+  if (!prefs.getBool("init", false)) {
+    migrateLegacy();
+    saveConfig();
+    prefs.putBool("init", true);
+  }
+  bootCount = prefs.getUInt("boots", bootCount) + 1;
+  prefs.putUInt("boots", bootCount);
+
+  analogReadResolution(10);
+  for (int i = 0; i < 4; i++) { char h[9]; snprintf(h, sizeof h, "%08lx", (unsigned long)esp_random()); csrf += h; }
+
+  // WiFi via WiFiManager (captive portal "Intercom-Setup" when no network is saved)
+  WiFi.mode(WIFI_STA);
+  WiFi.setHostname(cfg.host.c_str());
+  WiFiManager wm;
+  wm.setTitle("Intercom");
+  wm.setHostname(cfg.host.c_str());
+  wm.setConnectTimeout(20);
+  wm.setConfigPortalTimeout(300);
+  const char *apPass = cfg.webPass.length() >= 8 ? cfg.webPass.c_str() : nullptr;
+  if (!wm.autoConnect("Intercom-Setup", apPass)) { Serial.println("WiFi failed, restarting"); ESP.restart(); }
+  WiFi.setAutoReconnect(true);
+  Serial.println("WiFi: " + WiFi.localIP().toString());
+
+  // Time (needed for TLS checks and command age)
+  configTzTime(cfg.tz.c_str(), "pool.ntp.org", "time.google.com");
+  for (int i = 0; i < 50 && !timeValid(); i++) delay(100);
+
+  startMdns();
+  setupWeb();
+  applyTelegram();
+  mqtt.setBufferSize(1024);
+  mqtt.setKeepAlive(30);
+  mqtt.setSocketTimeout(5);
+  mqtt.setCallback(onMqtt);
+  lastMqttTry = millis() - MQTT_RETRY_MS;
+
+  esp_task_wdt_config_t wdt = { .timeout_ms = WDT_TIMEOUT_MS, .idle_core_mask = 0, .trigger_panic = true };
+  if (esp_task_wdt_reconfigure(&wdt) != ESP_OK) esp_task_wdt_init(&wdt);
+  esp_task_wdt_add(NULL);
+
+  addLog("🚀 Старт, загрузка №" + String(bootCount));
+  Serial.println("Portal: http://" + cfg.host + ".local/");
+}
 
 void loop() {
-  // Advanced watchdog feeding
-  softwareWatchdogFeed();
-  
-  // Continuous memory monitoring and emergency cleanup
-  uint32_t currentLoopMemory = ESP.getFreeHeap();
-  if (currentLoopMemory < 12000) {
-    Serial.println("🚨 LOOP: Critical memory detected: " + String(currentLoopMemory) + " bytes");
-    forceMemoryCleanup();
-    
-    // Double check after cleanup
-    currentLoopMemory = ESP.getFreeHeap();
-    if (currentLoopMemory < 10000) {
-      Serial.println("🚨 LOOP: Emergency restart - cleanup failed!");
-      emergencyRestart("Loop memory critically low");
-    }
-  }
-  
-  // Debug: показать что loop работает (каждые 30 секунд)
-  static unsigned long lastLoopDebug = 0;
-  if (millis() - lastLoopDebug > 30000) {
-    Serial.println("🔄 Loop running, memory: " + String(ESP.getFreeHeap()) + " bytes");
-    Serial.println("💡 Serial commands ready! Type 'ping' to test");
-    lastLoopDebug = millis();
-  }
-  
-  // System health monitoring
-  checkSystemHealth();
-  checkMemoryHealth();
-  
-  // Handle web server (with emergency mode)
-  uint32_t freeBeforeWeb = ESP.getFreeHeap();
-  if (freeBeforeWeb > 20000) {
-    // Full web server + OTA
-    server.handleClient();
-    ElegantOTA.loop();
-  } else if (freeBeforeWeb > 15000) {
-    // Web server only, no OTA
-    server.handleClient();
-  } else if (freeBeforeWeb > 10000) {
-    // EMERGENCY MODE: Handle only critical requests
-    server.handleClient();
-    static unsigned long lastCleanup = 0;
-    if (millis() - lastCleanup > 30000) {
-      forceMemoryCleanup();
-      lastCleanup = millis();
-    }
-  } else {
-    // Memory critically low - skip web server completely
-    static unsigned long lastWebWarning = 0;
-    if (millis() - lastWebWarning > 60000) {
-      Serial.print("🚨 Web disabled, mem: "); 
-      Serial.print(freeBeforeWeb); 
-      Serial.println("b");
-      lastWebWarning = millis();
-    }
-    forceMemoryCleanup();
-  }
-  
-  // Check for incoming calls
-  checkIncomingCall();
-  
-  // Handle Telegram messages
-  if (millis() > lastTimeBotRan + botRequestDelay) {
-    // Check memory before Telegram operations
-    uint32_t freeMem = ESP.getFreeHeap();
-    if (freeMem < 15000) {
-      Serial.println("🚨 Skipping Telegram check - low memory: " + String(freeMem) + " bytes");
-      forceMemoryCleanup();
-      lastTimeBotRan = millis();
-      
-      // Emergency restart if memory critically low
-      if (freeMem < 10000) {
-        Serial.println("🚨 CRITICAL: Memory too low for any operation!");
-        emergencyRestart("Memory critically low before Telegram");
-      }
-      return;
-    }
-    
-    beginCriticalOperation("Telegram Message Handling");
-    
-    // Reconnect if needed
-    if (!telegramConnected && (millis() - lastTelegramCheck > 30000)) {
-      if (reconnectTelegram()) {
-        telegramConnected = true;
-      }
-      lastTelegramCheck = millis();
-    }
-    
-    // Handle messages
-    if (telegramConnected || WiFi.status() == WL_CONNECTED) {
-      int numNewMessages = bot.getUpdates(bot.last_message_received + 1);
-      if (numNewMessages > 0) {
-        handleNewMessages(numNewMessages);
-        telegramConnected = true;
-        lastSuccessfulMessage = millis();
-        
-        while ((numNewMessages = bot.getUpdates(bot.last_message_received + 1)) > 0) {
-      handleNewMessages(numNewMessages);
-          lastSuccessfulMessage = millis();
-        }
-      } else if (numNewMessages < 0) {
-        Serial.println("❌ Telegram getUpdates failed");
-        telegramConnected = false;
-      }
-    }
-    
-    lastTimeBotRan = millis();
-    lastTelegramActivity = millis(); // Update activity timestamp
-    endCriticalOperation("Telegram Message Handling");
-  }
-  
-  // Basic Serial commands
+  esp_task_wdt_reset();
+  server.handleClient();
+  ElegantOTA.loop();
+  checkCall();
+  mqttLoop();
+  pollTelegram();
+
   if (Serial.available()) {
-    Serial.println("📡 Serial data available!");
-    String command = Serial.readString();
-    Serial.println("📥 Raw command: '" + command + "'");
-    command.trim();
-    Serial.println("🎯 Trimmed command: '" + command + "' (length: " + String(command.length()) + ")");
-    
-    if (command == "open") {
-      Serial.println("🚪 Manual open via Serial");
-      openIntercom();
-      Serial.println("✅ Intercom opened!");
-    } else if (command == "test") {
-      Serial.println("📤 Sending test message...");
-      bool sent = bot.sendMessage(CHAT_ID, "🧪 Test message from Serial", "");
-      Serial.println("📤 Test: " + String(sent ? "✅ Sent" : "❌ Failed"));
-      if (sent) {
-        telegramConnected = true;
-        lastSuccessfulMessage = millis();
-      }
-    } else if (command == "status") {
-      Serial.println("📊 === SYSTEM STATUS ===");
-      Serial.println("🌐 WiFi: " + String(WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected"));
-      if (WiFi.status() == WL_CONNECTED) {
-        Serial.println("📍 IP: " + WiFi.localIP().toString());
-        Serial.println("🌐 SSID: " + WiFi.SSID());
-        Serial.println("📶 Signal: " + String(WiFi.RSSI()) + " dBm");
-      }
-      Serial.println("💬 Telegram: " + String(telegramConnected ? "✅ Connected" : "❌ Disconnected"));
-      Serial.println("🔗 Port: " + String(workingTelegramPort));
-      Serial.println("🔓 SSL: Insecure (Livebox 6 compatible)");
-      Serial.println("💾 Memory: " + String(ESP.getFreeHeap()) + " bytes");
-      Serial.println("⏰ Uptime: " + String(millis() / 60000) + " min");
-      Serial.println("🔄 Boot count: " + String(settings.rebootCount));
-      Serial.println("📞 Call threshold: " + String(settings.callThreshold));
-      Serial.println("📊 Current A0: " + String(analogRead(callIndicatorPin)));
-      Serial.println("🕐 Time sync: " + String(timeInitialized ? "✅ Synced" : "❌ Not synced"));
-      Serial.println("🐕 Watchdog feeds: " + String(softwareWatchdogCounter));
-      Serial.println("💾 Minimum heap: " + String(minFreeHeap) + " bytes");
-      Serial.println("🔒 Critical operation: " + String(criticalOperationInProgress ? "IN PROGRESS" : "None"));
-    } else if (command == "restart") {
-      Serial.println("🔄 Manual restart via Serial...");
-      emergencyRestart("Manual restart via serial");
-    } else if (command == "cleanup") {
-      Serial.println("🧹 Manual memory cleanup...");
-      forceMemoryCleanup();
-      uint32_t afterCleanup = ESP.getFreeHeap();
-      Serial.println("💾 Memory after cleanup: " + String(afterCleanup) + " bytes");
-    } else if (command == "resetwifi") {
-      Serial.println("🗑️ Resetting WiFi settings...");
-      WiFiManager wm;
-      wm.resetSettings();
-      Serial.println("✅ WiFi settings cleared, restarting...");
-      delay(1000);
-      ESP.restart();
-    } else if (command == "wifiportal") {
-      Serial.println("📶 Starting WiFi configuration portal...");
-      WiFi.disconnect(true);
-      delay(1000);
-      WiFiManager wm;
-      wm.resetSettings();
-      wm.setConfigPortalTimeout(300); // 5 minute timeout
-      Serial.println("🔄 Creating 'TelegramIntercom' network...");
-      Serial.println("📱 Connect to 'TelegramIntercom' and go to 192.168.4.1");
-      wm.startConfigPortal("TelegramIntercom");
-    } else if (command == "forcereset") {
-      Serial.println("🔥 FORCE RESET - Clearing ALL WiFi data...");
-      WiFi.disconnect(true);
-      WiFi.mode(WIFI_OFF);
-      delay(1000);
-      // ESP32 doesn't have eraseConfig(), WiFiManager handles this
-      delay(1000);
-      Serial.println("💥 All settings erased, restarting...");
-      ESP.restart();
-    } else if (command == "scanwifi") {
-      Serial.println("🔍 Scanning for WiFi networks...");
-      int n = WiFi.scanNetworks();
-      if (n == 0) {
-        Serial.println("❌ No networks found");
-      } else {
-        Serial.println("📡 Found " + String(n) + " networks:");
-        for (int i = 0; i < n; ++i) {
-          // Разбиваем сложную конкатенацию WiFi info
-          Serial.print(i + 1); 
-          Serial.print(": "); 
-          Serial.print(WiFi.SSID(i)); 
-          Serial.print(" ("); 
-          Serial.print(WiFi.RSSI(i)); 
-          Serial.print(" dBm) "); 
-          Serial.println((WiFi.encryptionType(i) == WIFI_AUTH_OPEN) ? "🔓" : "🔒");
-        }
-      }
-    } else if (command == "ping") {
-      Serial.println("🏓 PONG! Serial commands working!");
-      Serial.println("📊 Memory: " + String(ESP.getFreeHeap()) + " bytes");
-      Serial.println("⏰ Uptime: " + String(millis() / 1000) + " seconds");
-    } else if (command == "memtest") {
-      Serial.println("🧪 === MEMORY TEST RESULTS ===");
-      uint32_t freeMem = ESP.getFreeHeap();
-      uint16_t fragmentation = 0; // ESP32 doesn't have getHeapFragmentation()
-      uint32_t maxBlock = ESP.getMaxAllocHeap();
-      
-      Serial.print("📊 Free: "); Serial.print(freeMem); Serial.println("b");
-      Serial.print("🧩 Frag: "); Serial.print(fragmentation); Serial.println("%");
-      Serial.print("📦 Block: "); Serial.print(maxBlock); Serial.println("b");
-      Serial.print("🏆 Min: "); Serial.print(minFreeHeap); Serial.println("b");
-      
-      // Тест на стабильность памяти
-      if (freeMem > 25000) {
-        Serial.println("🎯 ✅ EXCELLENT");
-      } else if (freeMem > 20000) {
-        Serial.println("🎯 ✅ GOOD");
-      } else if (freeMem > 15000) {
-        Serial.println("🎯 ⚠️ LOW");
-      } else if (freeMem > 10000) {
-        Serial.println("🎯 🚨 CRITICAL");
-      } else {
-        Serial.println("🎯 💀 EMERGENCY");
-      }
-      Serial.println("===============================");
-    } else if (command == "freemem") {
-      Serial.println("🧹 EMERGENCY MEMORY RECOVERY");
-      
-      // Агрессивная очистка
-      for (int i = 0; i < 50; i++) {
-        yield();
-        // ESP32 watchdog is handled automatically
-        delay(5);
-      }
-      
-      Serial.print("💾 Before: "); Serial.print(ESP.getFreeHeap()); Serial.println("b");
-      
-      // Принудительная сборка мусора
-      delay(500);
-      
-      uint32_t afterMem = ESP.getFreeHeap();
-      Serial.print("💾 After: "); Serial.print(afterMem); Serial.println("b");
-      
-      if (afterMem > 20000) {
-        Serial.println("✅ Memory recovered successfully");
-      } else {
-        Serial.println("⚠️ Memory still low - consider restart");
-      }
-    } else if (command == "help" || command == "?" || command == "") {
-      Serial.println(FPSTR(PROGMEM_HELP_MSG));
-    } else {
-      Serial.println("❓ Unknown command: '" + command + "'");
-      Serial.println("💡 Type 'help' to see available commands");
-    }
+    String c = Serial.readStringUntil('\n'); c.trim();
+    if (c == "open") { openDoor(); addLog("🚪 Открыто через Serial"); }
+    else if (c == "status") Serial.println(statusText());
+    else if (c == "restart") ESP.restart();
+    else if (c == "resetwifi") { WiFiManager wm; wm.resetSettings(); ESP.restart(); }
+    else Serial.println("Commands: open, status, restart, resetwifi");
   }
-  
-  delay(100);
+  delay(5);
 }
- 

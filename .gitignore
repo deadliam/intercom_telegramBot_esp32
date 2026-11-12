@@ -3,3 +3,4 @@ nodemcu_telegram/secrets.h
 build/
 
 
+.DS_Store
